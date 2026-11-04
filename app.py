@@ -8,11 +8,13 @@ import copy
 import hashlib
 import io
 import json
+import math
 import mimetypes
 import os
 from pathlib import Path
 import re
 import sqlite3
+import struct
 import threading
 import time
 import urllib.error
@@ -20,6 +22,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+import zlib
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xhs_connection import XHSConnection, ConnectionError as XHSConnectionError
@@ -198,6 +201,7 @@ def upload(project_id, body):
         features = body.get("features", {})
         if not isinstance(features, dict):
             raise Problem("图片分析数据无效。")
+        features = fill_features(raw, features)
         asset = {
             "id": ident(), "name": str(body.get("name", "image"))[:240],
             "file": filename, "preview": thumbnail, "mime": mime,
@@ -250,6 +254,8 @@ def update_project(project_id, body):
             if body["recipe_id"]:
                 get("recipes", body["recipe_id"])
             project["recipe_id"] = body["recipe_id"] or None
+        if "groups" in body:
+            project["groups"] = revise_groups(project.get("groups") or [], body["groups"])
         if "assets" in body:
             existing = {a["id"]: a for a in project["assets"]}
             incoming = body["assets"]
@@ -276,6 +282,7 @@ def add_version(project, label, source="manual", details=None):
         "assets": [{"id": a["id"], "selected": a["selected"], "role": a["role"]} for a in project["assets"]],
         "recipe_id": project.get("recipe_id"), "recipe": recipe, "details": details or {},
         "platforms": copy.deepcopy(project.get("platforms", ["xiaohongshu"])),
+        "groups": copy.deepcopy(project.get("groups") or []),
     }
     project["versions"].append(version)
     project["updated_at"] = now()
@@ -301,6 +308,486 @@ def local_plan(project):
         "style": {"name": "保留原片", "description": "未对照片施加任何风格或修图。", "positive_prompt": "", "negative_prompt": ""},
         "curator": "仅使用浏览器采样的亮度、对比度；不包含场景理解或人脸分析。",
     }
+
+
+# Grouping uses sampled color or a filename series. It is not face recognition.
+COLOR_GROUP_DISTANCE = 64
+SERIES_SUFFIX = r"(?:cover|covers|preview|previews|clean|final|edit|retouch|copy|key-visuals|visuals|封面|预览|修图|定稿)"
+GENERIC_SERIES = {"image", "photo", "picture", "img", "dsc", "pix", "frame", "原片", "修图", "定稿", "封面"}
+
+
+def fill_features(raw, features):
+    features = dict(features)
+    complete = features.get("palette") and features.get("width") and "brightness" in features and "contrast" in features
+    if not complete:
+        for key, value in sample_image_features(raw).items():
+            features.setdefault(key, value)
+    return {k: features[k] for k in ("width", "height", "brightness", "contrast", "sharpness", "palette") if k in features}
+
+
+def sample_image_features(raw):
+    try:
+        if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return sample_png_features(raw) or {}
+    except (struct.error, zlib.error, ValueError, IndexError):
+        return {}
+    return {}
+
+
+def paeth(left, up, upper_left):
+    estimate = left + up - upper_left
+    if abs(estimate - left) <= abs(estimate - up) and abs(estimate - left) <= abs(estimate - upper_left):
+        return left
+    return up if abs(estimate - up) <= abs(estimate - upper_left) else upper_left
+
+
+def sample_png_features(raw):
+    pos, width, height, color, bit, inter, idat = 8, None, None, None, None, None, []
+    while pos + 8 <= len(raw):
+        length = struct.unpack(">I", raw[pos:pos + 4])[0]
+        kind, chunk = raw[pos + 4:pos + 8], raw[pos + 8:pos + 8 + length]
+        pos += 12 + length
+        if kind == b"IHDR":
+            width, height, bit, color, _comp, _filt, inter = struct.unpack(">IIBBBBB", chunk)
+        elif kind == b"IDAT":
+            idat.append(chunk)
+        elif kind == b"IEND":
+            break
+    if bit != 8 or inter != 0 or color not in (2, 6) or not width or not height:
+        return {}
+    channels = 3 if color == 2 else 4
+    data = zlib.decompress(b"".join(idat))
+    stride = width * channels
+    if len(data) < height * (stride + 1):
+        return {}
+    previous, pixels, index = bytearray(stride), [], 0
+    step_x, step_y = max(1, width // 48), max(1, height // 48)
+    for y in range(height):
+        filter_type, index = data[index], index + 1
+        row = bytearray(data[index:index + stride])
+        index += stride
+        for x in range(stride):
+            left = row[x - channels] if x >= channels else 0
+            up = previous[x]
+            upper_left = previous[x - channels] if x >= channels else 0
+            if filter_type == 1:
+                row[x] = (row[x] + left) & 255
+            elif filter_type == 2:
+                row[x] = (row[x] + up) & 255
+            elif filter_type == 3:
+                row[x] = (row[x] + ((left + up) // 2)) & 255
+            elif filter_type == 4:
+                row[x] = (row[x] + paeth(left, up, upper_left)) & 255
+            elif filter_type != 0:
+                return {}
+        if y % step_y == 0:
+            for x in range(0, width, step_x):
+                pixel = x * channels
+                pixels.append((row[pixel], row[pixel + 1], row[pixel + 2]))
+        previous = row
+    return metrics_from_pixels(pixels, width, height)
+
+
+def metrics_from_pixels(pixels, width, height):
+    if not pixels:
+        return {}
+    total = total_sq = 0
+    buckets = {}
+    for red, green, blue in pixels:
+        light = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+        total += light
+        total_sq += light * light
+        key = tuple(min(255, int(round(channel / 48.0) * 48)) for channel in (red, green, blue))
+        buckets[key] = buckets.get(key, 0) + 1
+    count = len(pixels)
+    mean = total / count
+    palette = ["#%02x%02x%02x" % color for color, _n in sorted(buckets.items(), key=lambda item: item[1], reverse=True)[:5]]
+    return {
+        "width": width, "height": height,
+        "brightness": int(round(mean / 255 * 100)),
+        "contrast": int(round(math.sqrt(max(0, total_sq / count - mean * mean)) / 255 * 100)),
+        "palette": palette,
+    }
+
+
+def parse_hex(value):
+    if not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        return None
+    number = int(value[1:], 16)
+    return ((number >> 16) & 255, (number >> 8) & 255, number & 255)
+
+
+def signature(asset):
+    features = asset.get("features") or {}
+    palette = features.get("palette") if isinstance(features.get("palette"), list) else []
+    colors = [rgb for rgb in (parse_hex(item) for item in palette[:5]) if rgb]
+    rgb = tuple(sum(color[i] for color in colors) / len(colors) for i in range(3)) if colors else None
+
+    def number(key):
+        value = features.get(key)
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    brightness, contrast = number("brightness"), number("contrast")
+    if rgb is None and brightness is not None:
+        value = brightness / 100 * 255
+        rgb = (value, value, value)
+    return {"rgb": rgb, "brightness": brightness, "contrast": contrast, "has_palette": bool(colors)}
+
+
+def color_distance(left, right):
+    if not left["rgb"] or not right["rgb"]:
+        return None
+    color = math.sqrt(sum((left["rgb"][i] - right["rgb"][i]) ** 2 for i in range(3)))
+    if left["brightness"] is None or right["brightness"] is None:
+        return color
+    return color + abs(left["brightness"] - right["brightness"]) * 1.4
+
+
+def series_key(name):
+    stem = Path(str(name or "")).stem.lower()
+    previous = None
+    while stem != previous:
+        previous = stem
+        stem = re.sub(r"[-_ ]?\d{2,5}x\d{2,5}$", "", stem)
+        stem = re.sub(r"[-_ ]+" + SERIES_SUFFIX + r"$", "", stem)
+        stem = re.sub(r"[-_ ]*\d+$", "", stem)
+    stem = stem.strip("-_ ")
+    if len(stem) < 4 or stem in GENERIC_SERIES:
+        return ""
+    return stem
+
+
+def series_buckets(assets):
+    keys = [series_key(asset.get("name", "")) for asset in assets]
+    parent = list(range(len(assets)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for i in range(len(assets)):
+        for j in range(i + 1, len(assets)):
+            left, right = keys[i], keys[j]
+            if left and right and (left == right or left.startswith(right + "-") or right.startswith(left + "-")):
+                root = find(j)
+                parent[root] = find(i)
+    buckets = {}
+    for index, asset in enumerate(assets):
+        if keys[index]:
+            buckets.setdefault(find(index), []).append(asset)
+    return list(buckets.values())
+
+
+def cluster_by_color(assets):
+    clusters = [[asset] for asset in assets]
+
+    def mean(cluster):
+        sigs = [signature(asset) for asset in cluster]
+        rgbs = [item["rgb"] for item in sigs if item["rgb"]]
+        brights = [item["brightness"] for item in sigs if item["brightness"] is not None]
+        rgb = tuple(sum(color[i] for color in rgbs) / len(rgbs) for i in range(3)) if rgbs else None
+        return {"rgb": rgb, "brightness": sum(brights) / len(brights) if brights else None}
+
+    merged = True
+    while merged and len(clusters) > 1:
+        merged = False
+        means, best, best_distance = [mean(cluster) for cluster in clusters], None, COLOR_GROUP_DISTANCE
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                distance = color_distance(means[i], means[j])
+                if distance is not None and distance < best_distance:
+                    best, best_distance = (i, j), distance
+        if best:
+            clusters[best[0]].extend(clusters.pop(best[1]))
+            merged = True
+    return clusters
+
+
+def tone_name(rgb, brightness):
+    if not rgb:
+        return "一组"
+    spread = max(rgb) - min(rgb)
+    if spread < 26:
+        if brightness is not None and brightness < 40:
+            return "暗调"
+        if brightness is not None and brightness > 72:
+            return "明亮"
+        return "素净"
+    red, green, blue = rgb
+    if blue >= red and blue >= green and blue - red > 12:
+        return "蓝调"
+    if green >= red and green >= blue and green - red > 12:
+        return "绿调"
+    if red >= blue and red - blue > 18:
+        return "暖调"
+    return "中性"
+
+
+def style_reference(project):
+    recipe = None
+    if project.get("recipe_id"):
+        try:
+            recipe = get("recipes", project["recipe_id"])
+        except Problem:
+            recipe = None
+    if not recipe:
+        return {"name": "未指定风格", "description": "默认核对同一组的采样色彩、明暗和对比是否接近。", "positive_prompt": "", "negative_prompt": ""}
+    return {key: str(recipe.get(key, "")) for key in ("name", "description", "positive_prompt", "negative_prompt")}
+
+
+def suggest_cover(assets):
+    ranked = [(asset, signature(asset)) for asset in assets]
+    brights = sorted(item["brightness"] for _asset, item in ranked if item["brightness"] is not None)
+    if not brights:
+        return assets[0]
+    median = brights[len(brights) // 2]
+
+    def sort_key(pair, index):
+        _asset, item = pair
+        brightness = median if item["brightness"] is None else item["brightness"]
+        contrast = 0 if item["contrast"] is None else item["contrast"]
+        return (abs(brightness - median), -contrast, index)
+
+    return min(enumerate(ranked), key=lambda pair: sort_key(pair[1], pair[0]))[1][0]
+
+
+def level_for(value, ok, note):
+    if value <= ok:
+        return "ok"
+    return "note" if value <= note else "warn"
+
+
+def local_review(assets, cover, style):
+    sigs = [signature(asset) for asset in assets]
+    distances = [color_distance(sigs[i], sigs[j]) for i in range(len(sigs)) for j in range(i + 1, len(sigs))]
+    distances = [item for item in distances if item is not None]
+    brights = [item["brightness"] for item in sigs if item["brightness"] is not None]
+    contrasts = [item["contrast"] for item in sigs if item["contrast"] is not None]
+    items = []
+    if len(assets) < 2 or not distances:
+        items.append({"aspect": "色彩", "level": "note", "detail": "组内没有足够的色彩采样可比较。"})
+    else:
+        spread = max(distances)
+        items.append({"aspect": "色彩", "level": level_for(spread, 48, 96), "detail": "组内主色距离 %.0f。数字接近只说明采样颜色接近。" % spread})
+    if len(brights) >= 2:
+        spread = max(brights) - min(brights)
+        items.append({"aspect": "明暗", "level": level_for(spread, 18, 36), "detail": "亮度采样跨度 %.0f。" % spread})
+    if len(contrasts) >= 2:
+        spread = max(contrasts) - min(contrasts)
+        items.append({"aspect": "对比", "level": "ok" if spread <= 20 else "note", "detail": "对比度采样跨度 %.0f。这不是清晰度，也不是审美评分。" % spread})
+    elif assets:
+        items.append({"aspect": "对比", "level": "note", "detail": "缺少对比度采样。"})
+    items.append({"aspect": "封面", "level": "ok", "detail": "建议封面「%s」最接近这组的中间亮度，并在同等亮度里取更高的对比度采样。" % cover.get("name", "照片")})
+    if style["name"] == "未指定风格":
+        items.append({"aspect": "风格对照", "level": "note", "detail": "项目还没有风格配方。本次按未指定风格，只看同一组的采样是否接近。"})
+    else:
+        items.append({"aspect": "风格对照", "level": "note", "detail": "已读取配方「%s」。本地规则不能判断画面是否符合提示词。" % style["name"]})
+    measured = [item for item in items if item["aspect"] in ("色彩", "明暗", "对比")]
+    worst = "warn" if any(item["level"] == "warn" for item in measured) else "note" if any(item["level"] == "note" for item in measured) else "ok"
+    if len(assets) == 1:
+        summary = "这一组只有一张。标题和封面都先建议用它，由你决定。"
+    elif worst == "ok":
+        summary = "共 %s 张。采样色彩和明暗比较接近。" % len(assets)
+    else:
+        summary = "共 %s 张。有需要你亲自看的采样差异。" % len(assets)
+    return {
+        "origin": "local", "label": "本地规则草案", "style_name": style["name"], "vision": False, "photos_sent": False,
+        "limit": "本地规则只比较采样数字和文件名，不理解画面内容，也不是审美评分。",
+        "summary": summary, "items": items,
+    }
+
+
+def group_reason(signal, count):
+    if signal == "filename" and count > 1:
+        return "按文件名里的共同系列放在一组，已去掉末尾的序号、尺寸和封面等字样。不是人脸识别，也不是场景理解。"
+    if signal == "filename":
+        return "这张的文件名没有和其它照片形成系列，所以单独成组。不是人脸识别，也不是场景理解。"
+    if signal == "palette":
+        return "没有共同系列名，按采样主色和亮度接近放在一组。只说明颜色数字接近，不是审美评分。"
+    return "没有足够的系列名或色彩采样与其它照片归在一起，所以单独成组。不是人脸识别，也不是场景理解。"
+
+
+def make_group(project, assets, signal, style, used_titles):
+    cover = suggest_cover(assets)
+    sigs = [item for item in (signature(asset) for asset in assets) if item["rgb"]]
+    rgb = tuple(sum(item["rgb"][i] for item in sigs) / len(sigs) for i in range(3)) if sigs else None
+    brights = [item["brightness"] for item in sigs if item["brightness"] is not None]
+    tone = tone_name(rgb, sum(brights) / len(brights) if brights else None)
+    base = (project.get("title") or "未命名").strip() or "未命名"
+    title = "%s · %s" % (base, tone)
+    if title in used_titles:
+        number = 2
+        while "%s · %s %s" % (base, tone, number) in used_titles or "%s · %s %s" % (base, tone, number) == title:
+            number += 1
+        title = "%s · %s %s" % (base, tone, number)
+    return {
+        "id": ident(), "asset_ids": [asset["id"] for asset in assets], "signal": signal,
+        "title": title[:140], "title_origin": "local", "cover_asset_id": cover["id"], "cover_origin": "local",
+        "reason": group_reason(signal, len(assets)), "review": local_review(assets, cover, style),
+    }
+
+
+def build_groups(project):
+    assets = list(project.get("assets") or [])
+    rank = {asset["id"]: index for index, asset in enumerate(assets)}
+    named = series_buckets(assets)
+    named_ids = {asset["id"] for bucket in named for asset in bucket}
+    clusters = []
+    for bucket in named:
+        signal = "filename" if series_key(bucket[0].get("name", "")) else "single"
+        clusters.append((bucket, signal))
+    for bucket in cluster_by_color([asset for asset in assets if asset["id"] not in named_ids]):
+        usable = any(signature(asset)["has_palette"] or signature(asset)["brightness"] is not None for asset in bucket)
+        clusters.append((bucket, "palette" if len(bucket) > 1 and usable else "single"))
+    clusters.sort(key=lambda item: min(rank[asset["id"]] for asset in item[0]))
+    style, groups, titles = style_reference(project), [], []
+    for bucket, signal in clusters:
+        ordered = sorted(bucket, key=lambda asset: rank[asset["id"]])
+        group = make_group(project, ordered, signal, style, titles)
+        titles.append(group["title"])
+        groups.append(group)
+    return groups
+
+
+def revise_groups(groups, incoming):
+    if not isinstance(incoming, list):
+        raise Problem("分组数据无效。")
+    current = {group["id"]: group for group in groups}
+    for item in incoming:
+        if not isinstance(item, dict) or item.get("id") not in current:
+            raise Problem("分组已变化，请刷新后重试。", 409)
+        group = current[item["id"]]
+        if "title" in item:
+            title = str(item["title"]).strip()[:140]
+            if title and title != group["title"]:
+                group["title"] = title
+                group["title_origin"] = "manual"
+        if "cover_asset_id" in item and item["cover_asset_id"] != group["cover_asset_id"]:
+            if item["cover_asset_id"] not in group["asset_ids"]:
+                raise Problem("封面必须是这组里的照片。")
+            group["cover_asset_id"] = item["cover_asset_id"]
+            group["cover_origin"] = "manual"
+    return list(current.values())
+
+
+def apply_group(project_id, body):
+    use_title, use_cover, use_set = bool(body.get("use_title")), bool(body.get("use_cover")), bool(body.get("use_set"))
+    if not any((use_title, use_cover, use_set)):
+        raise Problem("请选择要采用的标题、封面或整组。")
+    with LOCK:
+        project = get("projects", project_id)
+        group = next((item for item in project.get("groups") or [] if item["id"] == body.get("group_id")), None)
+        if not group:
+            raise Problem("找不到这组选片。", 404)
+        assets = {asset["id"]: asset for asset in project["assets"]}
+        cover = group.get("cover_asset_id")
+        if (use_cover or use_set) and (cover not in assets or cover not in group["asset_ids"]):
+            raise Problem("封面不在这组照片中。")
+        missing = [asset_id for asset_id in group["asset_ids"] if asset_id not in assets]
+        if missing:
+            raise Problem("这组里有照片已经不在项目中，请重新分组。", 409)
+        add_version(project, "采用分组建议前自动快照", "checkpoint")
+        if use_set:
+            wanted = [cover] + [asset_id for asset_id in group["asset_ids"] if asset_id != cover]
+            chosen = [assets[asset_id] for asset_id in wanted]
+            rest = [asset for asset in project["assets"] if asset["id"] not in set(group["asset_ids"])]
+            for asset in chosen:
+                asset["selected"] = True
+            for asset in rest:
+                asset["selected"] = False
+            project["assets"] = chosen + rest
+        elif use_cover:
+            cover_asset = assets[cover]
+            cover_asset["selected"] = True
+            project["assets"] = [cover_asset] + [asset for asset in project["assets"] if asset["id"] != cover]
+        if use_title:
+            project["story"]["title"] = str(group["title"])[:30000]
+        project["updated_at"] = now()
+        add_version(project, "采用一组选片建议", "group-apply", {"group_id": group["id"], "use_title": use_title, "use_cover": use_cover, "use_set": use_set})
+        return project
+
+
+def ai_review(project, groups, job_id):
+    config = settings()
+    if not config["ai_base_url"] or not config["ai_model"]:
+        raise Problem("请先在连接设置中填写模型服务地址和模型名称。")
+    event(job_id, "风格核对：只发送采样指标和风格文字，不上传照片")
+    style = style_reference(project)
+    by_id = {asset["id"]: asset for asset in project["assets"]}
+    payload = {
+        "task": "对照 style 为每一组写风格核对，并建议标题和封面。只返回一个 JSON 对象 "
+                "{groups:[{asset_ids,title,cover_id,summary,items:[{aspect,level,detail}]}]}. "
+                "level 只能是 ok、note、warn。每一组的 asset_ids 必须与输入完全相同。cover_id 必须属于该组。"
+                "title 用中文，不超过 40 个字。不要编造地点、日期或人物经历，不要声称看见了照片。",
+        "style": style, "brief": project.get("brief", ""), "photos_sent": False,
+        "groups": [{"asset_ids": group["asset_ids"], "signal": group["signal"],
+                    "assets": [{"id": asset_id, "name": by_id[asset_id]["name"], "features": by_id[asset_id].get("features", {})} for asset_id in group["asset_ids"]]} for group in groups],
+    }
+    # Images stay on disk. The configured model only receives this JSON.
+    parsed = call_model(config, "风格核对", payload, None)
+    returned = parsed.get("groups")
+    if not isinstance(returned, list):
+        raise Problem("模型没有返回分组核对。未改动当前作品。", 502)
+    matched = {}
+    for item in returned:
+        if isinstance(item, dict) and isinstance(item.get("asset_ids"), list):
+            matched[frozenset(item["asset_ids"])] = item
+    reviewed = []
+    for group in groups:
+        item = matched.get(frozenset(group["asset_ids"]))
+        if item is None:
+            raise Problem("模型漏掉了其中一组。未改动当前作品。", 502)
+        title, cover, summary, raw_items = item.get("title"), item.get("cover_id"), item.get("summary"), item.get("items")
+        if not isinstance(title, str) or not title.strip() or not isinstance(summary, str) or not summary.strip():
+            raise Problem("模型返回的标题或核对说明无效。未改动当前作品。", 502)
+        if cover not in group["asset_ids"] or not isinstance(raw_items, list) or not raw_items:
+            raise Problem("模型返回的封面或分项核对无效。未改动当前作品。", 502)
+        items = []
+        for row in raw_items[:8]:
+            if not isinstance(row, dict) or row.get("level") not in ("ok", "note", "warn"):
+                raise Problem("模型返回的核对等级无效。未改动当前作品。", 502)
+            aspect, detail = row.get("aspect"), row.get("detail")
+            if not isinstance(aspect, str) or not aspect.strip() or not isinstance(detail, str) or not detail.strip():
+                raise Problem("模型返回的核对内容无效。未改动当前作品。", 502)
+            items.append({"aspect": aspect.strip()[:40], "level": row["level"], "detail": detail.strip()[:500]})
+        updated = copy.deepcopy(group)
+        updated.update(title=title.strip()[:80], title_origin="ai", cover_asset_id=cover, cover_origin="ai")
+        updated["review"] = {
+            "origin": "ai", "label": "AI 风格核对", "style_name": style["name"], "vision": False, "photos_sent": False,
+            "limit": "未发送照片。模型只看到采样指标、文件名和风格文字，不能据此声称看见画面。",
+            "summary": summary.strip()[:500], "items": items, "provider": {"model": config["ai_model"]},
+        }
+        reviewed.append(updated)
+    event(job_id, "风格核对已返回，正在校验每组照片和封面")
+    return reviewed
+
+
+def run_groups(job_id, project, mode):
+    try:
+        event(job_id, "读取已导入的照片与风格配方")
+        groups = build_groups(project)
+        if mode == "ai":
+            groups = ai_review(project, groups, job_id)
+            label, source = "AI 风格核对", "group-ai"
+        else:
+            event(job_id, "本地规则草案：按系列名或采样色彩分组，不调用模型，也不上传照片")
+            label, source = "本地分组草案", "group-local"
+        with LOCK:
+            current = get("projects", project["id"])
+            if {asset["id"] for asset in current["assets"]} != {asset["id"] for asset in project["assets"]}:
+                raise Problem("任务期间素材已变化。这次分组没有写入，请再运行一次。", 409)
+            add_version(current, "分组前自动快照", "checkpoint")
+            current["groups"] = groups
+            add_version(current, label, source, {"mode": mode, "photos_sent": False, "group_count": len(groups)})
+        event(job_id, "已保存 %s 个分组建议，采用前不会改你的选片" % len(groups))
+        complete_job(job_id, {"project_id": project["id"], "group_count": len(groups)})
+    except Exception as error:
+        complete_job(job_id, error=error if isinstance(error, Problem) else "分组任务遇到内部错误；请查看本地服务终端。")
+        if not isinstance(error, Problem):
+            import traceback
+            traceback.print_exc()
 
 
 def remote(url, body=None, headers=None, timeout=90):
@@ -721,6 +1208,7 @@ class Handler(BaseHTTPRequestHandler):
                     upload(project["id"], {"data": base64.b64encode(source.read_bytes()).decode(), "name": name, "origin": "existing-design-example"})
             project = get("projects", project["id"])
             project["story"] = {"title": "潮汐的注脚", "body": "海面上的光，在浪里短暂停留。\n\n把那些安静的瞬间，留在这一组里。", "notes": "演示文案。图片来自当前目录已有的设计产物，原文件未改动。"}
+            project["groups"] = build_groups(project)
             add_version(project, "示例初稿", "example")
             return project
         if len(parts) >= 2 and parts[0] == "projects":
@@ -768,6 +1256,8 @@ class Handler(BaseHTTPRequestHandler):
                         ordered.append(asset)
                     project["assets"] = ordered
                     project["story"] = copy.deepcopy(version["story"])
+                    if "groups" in version:
+                        project["groups"] = copy.deepcopy(version["groups"])
                     project["recipe_id"] = version.get("recipe_id")
                     if "platforms" in version:
                         project["platforms"] = copy.deepcopy(version["platforms"])
@@ -807,6 +1297,19 @@ class Handler(BaseHTTPRequestHandler):
                     publication["feedback"] = str(body.get("feedback", ""))[:10000]
                     project["updated_at"] = now()
                     return put("projects", project)
+            if action == "groups" and method == "POST":
+                if len(parts) == 4 and parts[3] == "apply":
+                    return apply_group(project_id, body)
+                if len(parts) != 3:
+                    raise Problem("接口不存在。", 404)
+                mode = body.get("mode", "local")
+                if mode not in ("local", "ai"):
+                    raise Problem("无效的分组模式。")
+                if mode == "ai" and not public_settings()["ai_configured"]:
+                    raise Problem("请先连接模型服务。未配置时可以生成本地分组草案。")
+                job, project = create_job(project_id, "groups", mode)
+                EXECUTOR.submit(run_groups, job["id"], project, mode)
+                return job
             if action == "plan" and method == "POST":
                 mode = body.get("mode", "local")
                 if mode not in ("local", "ai"):
