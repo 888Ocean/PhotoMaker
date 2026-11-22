@@ -27,7 +27,7 @@ import zlib
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from easel_xhs import calc_title_length
-from xhs_connection import XHSConnection, ConnectionError as XHSConnectionError, validate_draft
+from xhs_connection import XHSConnection, ConnectionError as XHSConnectionError
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("PHOTOMAKER_DATA_DIR", str(ROOT / "data"))).resolve()
@@ -413,11 +413,11 @@ def local_xhs_prepare(project_id, body):
             raise Problem("四项确认未齐，或内容已变化。没有生成本地素材包。")
         if "xiaohongshu" not in project.get("platforms", []):
             raise Problem("请先把小红书留在发布目标里。没有打包。")
-        try:
-            validate_draft(project, DATA)
-        except XHSConnectionError as error:
-            raise Problem(str(error))
         selected = selected_assets(project)
+        if not selected or len(selected) > 18:
+            raise Problem("本版每次准备 1–18 张图片。没有打包。")
+        if calc_title_length(current["title"]) > 20 or len(current["body"].encode("utf-16-le")) // 2 > 1000:
+            raise Problem("标题或正文超出本机上限。没有打包。")
         package_id = ident()
         root = DATA / "local-prepare" / package_id
         root.mkdir(parents=True)
@@ -1348,9 +1348,11 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["settings"]:
             return save_settings(body) if method == "POST" else public_settings()
         if parts == ["platforms"] and method == "GET":
-            status = xhs_connection().status()
-            return [{**platform, "account_connected": status["account_connected"] if platform["id"] == "xiaohongshu" else False,
-                     "connection": status if platform["id"] == "xiaohongshu" else {"state": "not_implemented", "message": "账号连接尚未实现；可导出素材包。"}} for platform in PLATFORMS]
+            # Do not touch the Xiaohongshu connection here. Story/library loads use this list.
+            # Live status stays on GET /connections/xiaohongshu, used by the publish and settings surfaces.
+            return [{**platform, "account_connected": False,
+                     "connection": {"state": "disconnected", "account_connected": False, "message": "发布页会单独读取连接状态。"} if platform["id"] == "xiaohongshu"
+                     else {"state": "not_implemented", "message": "账号连接尚未实现；可导出素材包。"}} for platform in PLATFORMS]
         if parts == ["connections", "xiaohongshu"]:
             connection = xhs_connection()
             if method == "GET":

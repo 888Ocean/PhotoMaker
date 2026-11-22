@@ -463,31 +463,118 @@ class LocalPrepareTests(unittest.TestCase):
         self.assertEqual(view["title"], "合成标题")
         self.assertEqual(view["body"], "合成正文")
 
-    def test_missing_confirm_modification_and_cancel_do_not_pack(self):
-        self.ready_story()
+    def latest(self):
+        return app.get("projects", self.project["id"])
+
+    def assert_freeze_blocked(self):
         with self.assertRaises(app.Problem):
             app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
         self.assertFalse((app.DATA / "local-prepare").exists())
-        self.confirm_all()
-        app.update_project(self.project["id"], {"story": {"title": "改过的标题", "body": "合成正文", "notes": ""}})
-        prepared = app.get("projects", self.project["id"])["xhs_prepare"]
-        self.assertTrue(all(not value for value in prepared["confirms"].values()))
-        with self.assertRaises(app.Problem):
-            app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
-        self.confirm_all()
-        packed = app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
+
+    def test_each_missing_confirm_blocks_freeze(self):
+        self.ready_story()
+        self.assert_freeze_blocked()
+        for missing in ("assets", "text", "account", "visibility"):
+            app.local_xhs_prepare(self.project["id"], {"action": "cancel"})
+            for item in ("assets", "text", "account", "visibility"):
+                if item == missing:
+                    continue
+                app.local_xhs_prepare(self.project["id"], {"action": "confirm", "item": item, "on": True, "account_intent": "合成账号意图", "visibility_intent": "仅自己可见"})
+            confirms = self.latest()["xhs_prepare"]["confirms"]
+            self.assertFalse(confirms[missing])
+            self.assertTrue(all(confirms[item] for item in confirms if item != missing))
+            self.assert_freeze_blocked()
+
+    def test_each_edit_revokes_every_confirm(self):
+        first, second = self.ready_story()
+        third = self.upload(solid_png(10, 180, 90), "synthetic-note-03.png")
+        cases = []
+
+        def revoke(name, mutate):
+            app.local_xhs_prepare(self.project["id"], {"action": "cancel"})
+            self.confirm_all()
+            mutate()
+            confirms = self.latest()["xhs_prepare"]["confirms"]
+            self.assertTrue(all(not value for value in confirms.values()), name)
+            self.assert_freeze_blocked()
+            cases.append(name)
+
+        current = self.latest()
+        ordered = [asset["id"] for asset in current["assets"]]
+        revoke("order", lambda: app.update_project(self.project["id"], {"assets": [
+            {"id": ordered[0], "selected": True, "role": "环境"},
+            {"id": ordered[2], "selected": True, "role": "细节"},
+            {"id": ordered[1], "selected": True, "role": "环境"},
+        ]}))
+        revoke("cover", lambda: app.update_project(self.project["id"], {"assets": [
+            {"id": second["id"], "selected": True, "role": "环境"},
+            {"id": first["id"], "selected": True, "role": "细节"},
+            {"id": third["id"], "selected": False, "role": "环境"},
+        ]}))
+        revoke("asset-set", lambda: app.update_project(self.project["id"], {"assets": [
+            {"id": first["id"], "selected": True, "role": "环境"},
+            {"id": second["id"], "selected": False, "role": "细节"},
+            {"id": third["id"], "selected": True, "role": "环境"},
+        ]}))
+        revoke("title", lambda: app.update_project(self.project["id"], {"story": {"title": "改过的标题", "body": "合成正文", "notes": ""}}))
+        revoke("body", lambda: app.update_project(self.project["id"], {"story": {"title": "合成标题", "body": "另一段正文", "notes": ""}}))
+        revoke("account-intent", lambda: app.local_xhs_prepare(self.project["id"], {"action": "confirm", "item": "account", "on": False, "account_intent": "另一个账号意图", "visibility_intent": "仅自己可见"}))
+        revoke("visibility-intent", lambda: app.local_xhs_prepare(self.project["id"], {"action": "confirm", "item": "visibility", "on": False, "account_intent": "合成账号意图", "visibility_intent": "公开"}))
+        self.assertEqual(cases, ["order", "cover", "asset-set", "title", "body", "account-intent", "visibility-intent"])
+
+    def test_cancel_drops_only_its_package_and_makes_no_external_call(self):
+        self.ready_story()
+        calls = []
+
+        def record(name):
+            def wrapped(*args, **kwargs):
+                calls.append(name)
+                raise AssertionError(name)
+            return wrapped
+
+        with patch.object(app.urllib.request, "urlopen", side_effect=record("urlopen")), \
+             patch.object(app, "xhs_connection", side_effect=record("xhs_connection")), \
+             patch.object(app, "remote", side_effect=record("remote")), \
+             patch.object(app.XHSConnection, "prepare", side_effect=record("XHSConnection.prepare")), \
+             patch.object(app.XHSConnection, "connect", side_effect=record("XHSConnection.connect")):
+            app.local_xhs_prepare(self.project["id"], {"action": "cancel"})
+            self.assertEqual(calls, [])
+            self.confirm_all()
+            packed = app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
+            self.assertEqual(calls, [])
         package = app.DATA / "local-prepare" / packed["xhs_prepare"]["package_id"]
-        self.assertTrue((package / "manifest.json").is_file())
+        decoy = app.DATA / "local-prepare" / "not-a-package"
+        decoy.mkdir()
+        (decoy / "keep.txt").write_text("do-not-delete", encoding="utf-8")
+        settings = app.DATA / "settings.json"
+        settings.write_text("{}", encoding="utf-8")
+        versions_before = len(packed["versions"])
         cancelled = app.local_xhs_prepare(self.project["id"], {"action": "cancel"})
         self.assertEqual(cancelled["xhs_prepare"]["status"], "idle")
         self.assertFalse(package.exists())
-        self.assertFalse(any((app.DATA / "local-prepare").glob("*")))
+        self.assertEqual((decoy / "keep.txt").read_text(), "do-not-delete")
+        self.assertTrue(settings.is_file())
+        self.assertEqual(len(cancelled["versions"]), versions_before)
 
     def test_package_matches_checksums_and_cannot_escape_asset_dir(self):
         first, second = self.ready_story()
         self.confirm_all()
-        with patch.object(app.urllib.request, "urlopen", side_effect=AssertionError("outbound")), patch.object(app, "xhs_connection", side_effect=AssertionError("old uploader")):
+        calls = []
+
+        def record(name):
+            def wrapped(*args, **kwargs):
+                calls.append(name)
+                raise AssertionError(name)
+            return wrapped
+
+        with patch.object(app.urllib.request, "urlopen", side_effect=record("urlopen")), \
+             patch.object(app, "xhs_connection", side_effect=record("xhs_connection")), \
+             patch.object(app, "remote", side_effect=record("remote")), \
+             patch.object(app.XHSConnection, "prepare", side_effect=record("XHSConnection.prepare")), \
+             patch.object(app.XHSConnection, "connect", side_effect=record("XHSConnection.connect")), \
+             patch.object(app.XHSConnection, "status", side_effect=record("XHSConnection.status")):
             packed = app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
+        self.assertEqual(calls, [])
         prep = packed["xhs_prepare"]
         self.assertEqual(prep["status"], "ready")
         package = app.DATA / "local-prepare" / prep["package_id"]

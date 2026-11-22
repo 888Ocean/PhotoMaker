@@ -36,6 +36,7 @@ dialog{border:1px solid #e3e6d9;border-radius:14px;width:min(560px,calc(100% - 3
 .prepare-head{display:flex;justify-content:space-between;gap:12px;align-items:baseline}
 .prepare-head h3{font-size:16px}
 #prepare-status{font-size:12px;color:var(--green)}
+.prepare-id{font-size:11px;color:var(--muted);margin-top:4px}
 .prepare-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;margin-top:10px}
 .prepare-check{display:flex;gap:8px;align-items:center;font-size:12px}
 .prepare-actions{display:flex;gap:8px;margin-top:12px}

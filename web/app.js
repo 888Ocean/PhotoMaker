@@ -116,7 +116,7 @@ function preparePanel(p) {
   const selected=p.assets.filter(a=>a.selected);
   const canFreeze=PREPARE_ITEMS.every(item=>confirms[item])&&selected.length&&(p.story.title||'').trim()&&(p.story.body||'').trim()&&(prep.account_intent||'').trim()&&prep.visibility_intent;
   const box=(item,label)=>`<label class="prepare-check"><input type="checkbox" data-prepare-item="${item}" ${confirms[item]?'checked':''}><span>${label}</span></label>`;
-  return `<section class="prepare-panel" aria-label="小红书图文本地准备"><div class="prepare-head"><h3>小红书图文本地准备</h3><p id="prepare-status">${ready?'本地已准备；插件未连接':'尚未生成本地素材包。插件未连接。'}</p></div><p class="muted">这是交给以后插件复用的本地准备，现在不填官方表，也不发布。账号和可见范围只记下你的意图。</p><div class="prepare-grid">${box('assets','确认素材顺序和封面')}${box('text','确认标题和正文')}<label class="field"><span>账号意图</span><input id="prepare-account" maxlength="80" value="${e(prep.account_intent||'')}" placeholder="例如：我的小红书账号"></label>${box('account','确认账号意图')}<label class="field"><span>可见范围意图</span><select id="prepare-visibility"><option value="" ${prep.visibility_intent?'':'selected'}>请选择</option><option value="公开" ${prep.visibility_intent==='公开'?'selected':''}>公开</option><option value="仅自己可见" ${prep.visibility_intent==='仅自己可见'?'selected':''}>仅自己可见</option></select></label>${box('visibility','确认可见范围意图')}</div><div class="prepare-actions">${button('prepare-freeze','生成本地素材包','check','primary',canFreeze?'':'disabled')}${button('prepare-cancel','取消','','secondary')}</div></section>`;
+  return `<section class="prepare-panel" aria-label="小红书图文本地准备" data-prepare-project="${e(p.id)}"><div class="prepare-head"><h3>小红书图文本地准备</h3><p id="prepare-status">${ready?'本地已准备；插件未连接':'尚未生成本地素材包。插件未连接。'}</p></div><p class="prepare-id">准备编号 ${e(p.id)}</p><p class="muted">这是交给以后插件复用的本地准备，现在不填官方表，也不发布。账号和可见范围只记下你的意图。</p><div class="prepare-grid">${box('assets','确认素材顺序和封面')}${box('text','确认标题和正文')}<label class="field"><span>账号意图</span><input id="prepare-account" maxlength="80" value="${e(prep.account_intent||'')}" placeholder="例如：我的小红书账号"></label>${box('account','确认账号意图')}<label class="field"><span>可见范围意图</span><select id="prepare-visibility"><option value="" ${prep.visibility_intent?'':'selected'}>请选择</option><option value="公开" ${prep.visibility_intent==='公开'?'selected':''}>公开</option><option value="仅自己可见" ${prep.visibility_intent==='仅自己可见'?'selected':''}>仅自己可见</option></select></label>${box('visibility','确认可见范围意图')}</div><div class="prepare-actions">${button('prepare-freeze','生成本地素材包','check','primary',canFreeze?'':'disabled')}${button('prepare-cancel','取消','','secondary')}</div></section>`;
 }
 const PREPARE_ITEMS=['assets','account','text','visibility'];
 function story(p) {
@@ -416,6 +416,12 @@ function updateXhsStatus(){
   const draft=$('#xhs-draft-status');if(draft){const s=xhsStatus();draft.textContent='小红书：'+xhsStatusText(s.state)+'。'+(s.project_id&&s.project_id!==state.project?.id?'另一作品正在使用该窗口。':s.message);const b=$('[data-action="xhs-draft"]');if(b)b.disabled=s.state!=='connected'||!state.project?.platforms.includes('xiaohongshu');}
   const record=$('[data-action="xhs-record-publication"]');if(record){const s=xhsStatus();record.disabled=s.state==='preparing'&&s.project_id===state.project?.id;}
 }
+function connectionSurfaceActive() {
+  const parts=location.hash.split('/');
+  const section=parts[1]||'';
+  if(section==='settings')return true;
+  return section==='project'&&state.tab==='publish';
+}
 let xhsPolling=false;
-setInterval(async()=>{if(xhsPolling||!['settings','project'].includes(location.hash.split('/')[1]))return;xhsPolling=true;try{setXhsStatus(await api('/connections/xiaohongshu'));updateXhsStatus();}catch{}finally{xhsPolling=false;}},2000);
+setInterval(async()=>{if(xhsPolling||!connectionSurfaceActive())return;xhsPolling=true;try{setXhsStatus(await api('/connections/xiaohongshu'));updateXhsStatus();}catch{}finally{xhsPolling=false;}},2000);
 route();
