@@ -428,5 +428,101 @@ class GroupingTests(unittest.TestCase):
         return app.get("projects", self.project["id"])
 
 
+class LocalPrepareTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="photomaker-prepare-")
+        self.original = app.DATA
+        app.DATA = Path(self.directory.name)
+        app.init()
+        self.project = app.new_project({"title": "合成图文", "brief": "", "platform": "小红书"})
+
+    def tearDown(self):
+        app.DATA = self.original
+        self.directory.cleanup()
+
+    def upload(self, raw, name):
+        body = {"data": base64.b64encode(raw).decode(), "name": name, "features": {"width": 8, "height": 8, "brightness": 40, "contrast": 10, "palette": ["#224466"]}}
+        return app.upload(self.project["id"], body)["asset"]
+
+    def ready_story(self):
+        first = self.upload(solid_png(20, 40, 180), "synthetic-note-01.png")
+        second = self.upload(solid_png(200, 120, 40), "synthetic-note-02.png")
+        app.update_project(self.project["id"], {"story": {"title": "合成标题", "body": "合成正文", "notes": "不进清单"}})
+        return first, second
+
+    def confirm_all(self):
+        for item in ("assets", "text", "account", "visibility"):
+            app.local_xhs_prepare(self.project["id"], {"action": "confirm", "item": item, "on": True, "account_intent": "合成账号意图", "visibility_intent": "仅自己可见"})
+
+    def test_preview_fingerprint_matches_selection_cover_title_and_body(self):
+        first, second = self.ready_story()
+        app.update_project(self.project["id"], {"assets": [{"id": second["id"], "selected": True}, {"id": first["id"], "selected": True}]})
+        view = app.content_fingerprint(app.get("projects", self.project["id"]))
+        self.assertEqual(view["asset_ids"], [second["id"], first["id"]])
+        self.assertEqual(view["cover_asset_id"], second["id"])
+        self.assertEqual(view["title"], "合成标题")
+        self.assertEqual(view["body"], "合成正文")
+
+    def test_missing_confirm_modification_and_cancel_do_not_pack(self):
+        self.ready_story()
+        with self.assertRaises(app.Problem):
+            app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
+        self.assertFalse((app.DATA / "local-prepare").exists())
+        self.confirm_all()
+        app.update_project(self.project["id"], {"story": {"title": "改过的标题", "body": "合成正文", "notes": ""}})
+        prepared = app.get("projects", self.project["id"])["xhs_prepare"]
+        self.assertTrue(all(not value for value in prepared["confirms"].values()))
+        with self.assertRaises(app.Problem):
+            app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
+        self.confirm_all()
+        packed = app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
+        package = app.DATA / "local-prepare" / packed["xhs_prepare"]["package_id"]
+        self.assertTrue((package / "manifest.json").is_file())
+        cancelled = app.local_xhs_prepare(self.project["id"], {"action": "cancel"})
+        self.assertEqual(cancelled["xhs_prepare"]["status"], "idle")
+        self.assertFalse(package.exists())
+        self.assertFalse(any((app.DATA / "local-prepare").glob("*")))
+
+    def test_package_matches_checksums_and_cannot_escape_asset_dir(self):
+        first, second = self.ready_story()
+        self.confirm_all()
+        with patch.object(app.urllib.request, "urlopen", side_effect=AssertionError("outbound")), patch.object(app, "xhs_connection", side_effect=AssertionError("old uploader")):
+            packed = app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
+        prep = packed["xhs_prepare"]
+        self.assertEqual(prep["status"], "ready")
+        package = app.DATA / "local-prepare" / prep["package_id"]
+        names = sorted(path.name for path in package.iterdir())
+        self.assertEqual(names, ["01.png", "02.png", "manifest.json"])
+        manifest = json.loads((package / "manifest.json").read_text())
+        self.assertEqual(manifest["kind"], "photomaker-local-prepare")
+        self.assertFalse(manifest["maitian_api"])
+        self.assertFalse(manifest["claims_platform_set"])
+        self.assertEqual(manifest["status"], "本地已准备；插件未连接")
+        self.assertEqual(manifest["account_intent"], "合成账号意图")
+        self.assertEqual(manifest["visibility_intent"], "仅自己可见")
+        self.assertNotIn("settings.json", names)
+        for item in manifest["files"]:
+            blob = (package / item["name"]).read_bytes()
+            self.assertEqual(app.hashlib.sha256(blob).hexdigest(), item["sha256"])
+            self.assertFalse((package / item["name"]).is_symlink())
+        self.assertEqual((package / "01.png").read_bytes(), (app.DATA / "assets" / first["file"]).read_bytes())
+        self.assertEqual(packed["versions"][-1]["source"], "xhs-local-prepare")
+        self.assertEqual(packed["versions"][-1]["details"]["files"], manifest["files"])
+        outside = app.DATA / "settings.json"
+        outside.write_text('{"ai_api_key":"secret"}', encoding="utf-8")
+        link = app.DATA / "assets" / first["file"]
+        link.unlink()
+        link.symlink_to(outside)
+        self.confirm_all()
+        with self.assertRaises(app.Problem):
+            app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
+        self.assertFalse(any(path.name != "manifest.json" and "secret" in path.read_text(errors="ignore") for path in (app.DATA / "local-prepare").glob("*/*")))
+        with self.assertRaises(app.Problem):
+            app.safe_asset_bytes({"file": "../settings.json", "sha256": "abc"})
+
+    def latest_unused(self):
+        return None
+
+
 if __name__ == "__main__":
     unittest.main()

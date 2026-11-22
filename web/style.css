@@ -32,4 +32,11 @@ dialog{border:1px solid #e3e6d9;border-radius:14px;width:min(560px,calc(100% - 3
 .group-actions{display:flex;gap:8px;flex-wrap:wrap}
 .group-chip{display:inline-block;margin-left:6px;font-size:10px;color:var(--green)}
 .group-empty{margin:4px 0 10px}
+.prepare-panel{margin:0 0 18px;padding:14px;border:1px solid var(--line);border-radius:10px;background:#fbfaf6}
+.prepare-head{display:flex;justify-content:space-between;gap:12px;align-items:baseline}
+.prepare-head h3{font-size:16px}
+#prepare-status{font-size:12px;color:var(--green)}
+.prepare-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;margin-top:10px}
+.prepare-check{display:flex;gap:8px;align-items:center;font-size:12px}
+.prepare-actions{display:flex;gap:8px;margin-top:12px}
 @media(max-width:680px){.group-board-head{flex-direction:column}.group-board-actions{width:100%;flex-wrap:wrap}}

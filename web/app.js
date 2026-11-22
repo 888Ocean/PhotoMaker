@@ -109,12 +109,22 @@ function assetCard(a,i) {
   const f=a.features||{};
   return `<article class="asset-card ${a.selected?'selected':''}" draggable="true" data-asset="${a.id}"><div class="asset-image"><button class="image-open" data-action="preview" data-id="${a.id}" aria-label="查看 ${e(a.name)}"><img src="${media(a)}" alt="${e(a.name)}" loading="lazy"></button><button class="select-check ${a.selected?'checked':''}" data-action="toggle-photo" data-id="${a.id}" aria-label="${a.selected?'取消选择':'选择'} ${e(a.name)}" aria-pressed="${a.selected}">${a.selected?icon('check'):''}</button><span class="asset-number">${String(i+1).padStart(2,'0')}</span>${a.origin==='comfyui'?'<span class="generated-label">风格输出</span>':''}</div><div class="asset-info"><b title="${e(a.name)}">${e(a.name)}</b>${groupLabel(a.id)?`<small class="group-chip">${groupLabel(a.id)}</small>`:''}<div class="asset-detail"><span>${f.width?`${f.width} × ${f.height}`:Math.round(a.size/1024)+' KB'}</span><select data-role-id="${a.id}" aria-label="${e(a.name)} 的叙事角色">${roles.map(r=>`<option ${a.role===r?'selected':''}>${r}</option>`).join('')}</select></div>${f.palette?`<div class="palette">${f.palette.map(c=>/^#[0-9a-f]{6}$/i.test(c)?`<span style="background:${c}"></span>`:'').join('')}<small>采样色彩</small></div>`:''}<div class="asset-order"><button data-action="move-left" data-id="${a.id}" ${i===0?'disabled':''} aria-label="前移 ${e(a.name)}">${icon('back')}</button><span>拖动排序</span><button data-action="move-right" data-id="${a.id}" ${i===state.project.assets.length-1?'disabled':''} aria-label="后移 ${e(a.name)}">${icon('arrow')}</button></div></div></article>`;
 }
+function preparePanel(p) {
+  const prep=p.xhs_prepare||{status:'idle',confirms:{},account_intent:'',visibility_intent:''};
+  const confirms=prep.confirms||{};
+  const ready=prep.status==='ready';
+  const selected=p.assets.filter(a=>a.selected);
+  const canFreeze=PREPARE_ITEMS.every(item=>confirms[item])&&selected.length&&(p.story.title||'').trim()&&(p.story.body||'').trim()&&(prep.account_intent||'').trim()&&prep.visibility_intent;
+  const box=(item,label)=>`<label class="prepare-check"><input type="checkbox" data-prepare-item="${item}" ${confirms[item]?'checked':''}><span>${label}</span></label>`;
+  return `<section class="prepare-panel" aria-label="小红书图文本地准备"><div class="prepare-head"><h3>小红书图文本地准备</h3><p id="prepare-status">${ready?'本地已准备；插件未连接':'尚未生成本地素材包。插件未连接。'}</p></div><p class="muted">这是交给以后插件复用的本地准备，现在不填官方表，也不发布。账号和可见范围只记下你的意图。</p><div class="prepare-grid">${box('assets','确认素材顺序和封面')}${box('text','确认标题和正文')}<label class="field"><span>账号意图</span><input id="prepare-account" maxlength="80" value="${e(prep.account_intent||'')}" placeholder="例如：我的小红书账号"></label>${box('account','确认账号意图')}<label class="field"><span>可见范围意图</span><select id="prepare-visibility"><option value="" ${prep.visibility_intent?'':'selected'}>请选择</option><option value="公开" ${prep.visibility_intent==='公开'?'selected':''}>公开</option><option value="仅自己可见" ${prep.visibility_intent==='仅自己可见'?'selected':''}>仅自己可见</option></select></label>${box('visibility','确认可见范围意图')}</div><div class="prepare-actions">${button('prepare-freeze','生成本地素材包','check','primary',canFreeze?'':'disabled')}${button('prepare-cancel','取消','','secondary')}</div></section>`;
+}
+const PREPARE_ITEMS=['assets','account','text','visibility'];
 function story(p) {
   const selected=p.assets.filter(a=>a.selected);
-  return `<div class="panel-heading"><div><h2>把画面，连成故事</h2><p>照片沿用选片顺序。文案可自由编辑，并随版本保存。</p></div>${badge('人工确认')}</div><div class="story-layout"><div class="phone-preview">${selected[0]?`<img src="${media(selected[0])}" alt="发布封面" class="story-cover">`:`<div class="story-cover no-image">${icon('image')}还没有封面</div>`}<div class="phone-body"><span class="phone-user"><span class="avatar small">O</span> 我的视觉日记</span><h3 id="story-preview-title">${e(p.story.title||p.title)}</h3><p id="story-preview-body">${e(p.story.body||'在右侧写下这组照片的故事。')}</p><small>${e(platformLabels(p))} · 预览</small></div></div><div class="story-fields"><label class="field"><span>作品标题</span><input id="story-title" placeholder="给这组照片一个名字" value="${e(p.story.title)}" maxlength="200"></label><label class="field"><span>正文</span><textarea id="story-body" rows="12" placeholder="从一个画面、一种感受，或者一句想说的话开始。">${e(p.story.body)}</textarea></label><label class="field"><span>创作备注 <small>不会混入发布正文</small></span><textarea id="story-notes" rows="4" placeholder="方案来源、待确认事项、调整方向…">${e(p.story.notes)}</textarea></label></div></div><h3 class="sequence-title">发布顺序 <span>${selected.length} 张</span></h3><div class="story-sequence">${selected.map((a,i)=>`<div><img src="${media(a)}" alt="${e(a.name)}"><small>${String(i+1).padStart(2,'0')} / ${e(a.role)}</small></div>`).join('')||'<p class="muted">先到素材页选几张照片。</p>'}</div>`;
+  return `<div class="panel-heading"><div><h2>把画面，连成故事</h2><p>照片沿用选片顺序。文案可自由编辑，并随版本保存。</p></div>${badge('人工确认')}</div>${preparePanel(p)}<div class="story-layout"><div class="phone-preview">${selected[0]?`<img src="${media(selected[0])}" alt="发布封面" class="story-cover">`:`<div class="story-cover no-image">${icon('image')}还没有封面</div>`}<div class="phone-body"><span class="phone-user"><span class="avatar small">O</span> 我的视觉日记</span><h3 id="story-preview-title">${e(p.story.title||p.title)}</h3><p id="story-preview-body">${e(p.story.body||'在右侧写下这组照片的故事。')}</p><small>${e(platformLabels(p))} · 预览</small></div></div><div class="story-fields"><label class="field"><span>作品标题</span><input id="story-title" placeholder="给这组照片一个名字" value="${e(p.story.title)}" maxlength="200"></label><label class="field"><span>正文</span><textarea id="story-body" rows="12" placeholder="从一个画面、一种感受，或者一句想说的话开始。">${e(p.story.body)}</textarea></label><label class="field"><span>创作备注 <small>不会混入发布正文</small></span><textarea id="story-notes" rows="4" placeholder="方案来源、待确认事项、调整方向…">${e(p.story.notes)}</textarea></label></div></div><h3 class="sequence-title">发布顺序 <span>${selected.length} 张</span></h3><div class="story-sequence">${selected.map((a,i)=>`<div><img src="${media(a)}" alt="${e(a.name)}"><small>${String(i+1).padStart(2,'0')} / ${e(a.role)}</small></div>`).join('')||'<p class="muted">先到素材页选几张照片。</p>'}</div>`;
 }
 function versions(p) {
-  return `<div class="panel-heading"><div><h2>每一版，都有来处</h2><p>恢复历史版本时，会先自动保存当前状态。原图始终保留。</p></div>${button('save-version','保存当前版本','plus')}</div><div class="version-list">${[...p.versions].reverse().map(v=>`<article class="version-item"><span class="version-dot"></span><div class="version-main"><div class="version-top"><b>v${v.number} <span>${e(v.label)}</span></b>${badge(({ai:'AI 专家',local:'本地规则',manual:'手动',checkpoint:'自动快照',restore:'版本恢复',comfyui:'风格输出',publication:'发布版',example:'示例',duplicate:'作品副本','group-local':'本地分组','group-ai':'AI 风格核对','group-apply':'采用分组'})[v.source]||v.source)}</div><p>${dateTime(v.created_at)}<i>·</i>${v.assets.filter(a=>a.selected).length} 张已选<i>·</i>${e(v.recipe?.name||'保留原片')}</p><div class="version-thumbs">${v.assets.filter(a=>a.selected).slice(0,6).map(a=>{const item=p.assets.find(x=>x.id===a.id);return item?`<img src="${media(item)}" alt="版本照片">`:'';}).join('')}</div><div class="version-story">${e(v.story.title||'尚未设置标题')}</div></div><div class="version-buttons">${button('view-version','查看','','text-button',`data-id="${v.id}"`)}${button('restore-version','恢复','','secondary',`data-id="${v.id}"`)}</div></article>`).join('')||`<div class="empty-small">${icon('layers')}<h3>为第一次创作留一个节点</h3><p>保存后，你就可以比较和恢复不同的创作版本。</p></div>`}</div>`;
+  return `<div class="panel-heading"><div><h2>每一版，都有来处</h2><p>恢复历史版本时，会先自动保存当前状态。原图始终保留。</p></div>${button('save-version','保存当前版本','plus')}</div><div class="version-list">${[...p.versions].reverse().map(v=>`<article class="version-item"><span class="version-dot"></span><div class="version-main"><div class="version-top"><b>v${v.number} <span>${e(v.label)}</span></b>${badge(({ai:'AI 专家',local:'本地规则',manual:'手动',checkpoint:'自动快照',restore:'版本恢复',comfyui:'风格输出',publication:'发布版',example:'示例',duplicate:'作品副本','group-local':'本地分组','group-ai':'AI 风格核对','group-apply':'采用分组','xhs-local-prepare':'本地准备'})[v.source]||v.source)}</div><p>${dateTime(v.created_at)}<i>·</i>${v.assets.filter(a=>a.selected).length} 张已选<i>·</i>${e(v.recipe?.name||'保留原片')}</p><div class="version-thumbs">${v.assets.filter(a=>a.selected).slice(0,6).map(a=>{const item=p.assets.find(x=>x.id===a.id);return item?`<img src="${media(item)}" alt="版本照片">`:'';}).join('')}</div><div class="version-story">${e(v.story.title||'尚未设置标题')}</div></div><div class="version-buttons">${button('view-version','查看','','text-button',`data-id="${v.id}"`)}${button('restore-version','恢复','','secondary',`data-id="${v.id}"`)}</div></article>`).join('')||`<div class="empty-small">${icon('layers')}<h3>为第一次创作留一个节点</h3><p>保存后，你就可以比较和恢复不同的创作版本。</p></div>`}</div>`;
 }
 function publication(p) {
   return `<div class="panel-heading"><div><h2>发布只是另一个起点</h2><p>导出后自行发布，再把链接和反馈留在这里。</p></div></div><div class="publish-callout"><span class="large-icon">${icon('check')}</span><div><h3>把这一版，正式归档</h3><p>保存当前选片、文案与风格快照。不会自动发布到社交平台。</p></div>${button('publish','登记发布','plus','primary')}</div><div class="publication-list">${[...p.publications].reverse().map(pub=>`<article class="publication-item"><div class="mini-heading"><h3>${e(pub.platform)} ${badge('v'+(p.versions.find(v=>v.id===pub.version_id)?.number||'?'),'green')}</h3><small>${dateTime(pub.published_at)}</small></div>${pub.url?`<a class="external-link" href="${e(pub.url)}" target="_blank" rel="noopener noreferrer">${icon('link')}查看已发布作品 ${icon('arrow')}</a>`:'<p class="muted">未填写发布链接</p>'}<label class="field"><span>反馈与下一次调整</span><textarea rows="3" data-feedback="${pub.id}" placeholder="记录浏览量、收藏、询问，或你对这次作品的新想法。">${e(pub.feedback)}</textarea></label><small class="muted">反馈由你手动记录，不会自动读取平台数据。</small></article>`).join('')}</div>`;
@@ -163,6 +173,14 @@ function recipeModal(existing) {
   }
   modal('保存一套风格配方',`<form id="recipe-form"><label class="field"><span>配方名称</span><input name="name" required maxlength="140" placeholder="例如：潮汐 · 柔和蓝调"></label><label class="field"><span>视觉说明</span><textarea name="description" rows="3" placeholder="色彩、光线、构图、颗粒、适用照片条件…"></textarea></label><label class="field"><span>正向提示词</span><textarea name="positive_prompt" rows="3" placeholder="soft cinematic light, muted ocean blue…"></textarea></label><label class="field"><span>负向提示词</span><textarea name="negative_prompt" rows="2" placeholder="oversaturated, distorted…"></textarea></label><label class="field"><span>ComfyUI API 工作流 <small>选填</small></span><input id="workflow-file" type="file" accept=".json,application/json"><textarea name="workflow" id="workflow-json" rows="5" spellcheck="false" placeholder='{"1":{"class_type":"…","inputs":{…}}}'></textarea><small>支持 {{input_image}}、{{positive_prompt}}、{{negative_prompt}} 替换。请导出 API 格式，而非画布界面格式。</small></label><div class="form-actions"><button type="button" class="button secondary" data-action="close-modal">取消</button><button type="submit" class="button primary">${icon('check')}保存风格配方</button></div></form>`);
 }
+function invalidatePrepareLocal() {
+  const prep=state.project?.xhs_prepare; if(!prep)return;
+  prep.status='idle'; prep.package_id=null; prep.version_id=null;
+  prep.confirms={assets:false,account:false,text:false,visibility:false};
+  document.querySelectorAll('[data-prepare-item]').forEach(box=>{box.checked=false;});
+  const status=$('#prepare-status'); if(status)status.textContent='尚未生成本地素材包。插件未连接。';
+  const freeze=document.querySelector('[data-action="prepare-freeze"]'); if(freeze)freeze.disabled=true;
+}
 function markDirty() {
   state.dirty=true; const label=$('#save-state');if(label)label.textContent='正在保存…';
   clearTimeout(saveTimer);saveTimer=setTimeout(()=>flush().catch(err=>toast(err.message,true)),550);
@@ -173,7 +191,7 @@ async function flush() {
   const p=state.project, payload={title:p.title,brief:p.brief,platform:p.platform,platforms:p.platforms,story:{...p.story},recipe_id:p.recipe_id,assets:p.assets.map(a=>({id:a.id,selected:a.selected,role:a.role}))};
   state.dirty=false;
   const task=saveQueue.catch(()=>{}).then(()=>api('/projects/'+p.id,payload,'PATCH')).then(result=>{
-    if(state.project?.id===p.id){state.project.updated_at=result.updated_at;const label=$('#save-state');if(label)label.textContent=state.dirty?'正在保存…':'已保存到本地';}
+    if(state.project?.id===p.id){state.project.updated_at=result.updated_at;if(result.xhs_prepare)state.project.xhs_prepare=result.xhs_prepare;const label=$('#save-state');if(label)label.textContent=state.dirty?'正在保存…':'已保存到本地';const status=$('#prepare-status');if(status)status.textContent=result.xhs_prepare?.status==='ready'?'本地已准备；插件未连接':'尚未生成本地素材包。插件未连接。';}
     return result;
   }).catch(err=>{if(state.project?.id===p.id){state.dirty=true;const label=$('#save-state');if(label)label.textContent='保存失败 · 请重试';}throw err;});
   saveQueue=task;return task;
@@ -195,8 +213,8 @@ async function route() {
   try{
     await flush();if(number!==routeNumber)return;
     await refreshData();if(number!==routeNumber)return;
-    const [,section,id]=location.hash.split('/');
-    if(section==='project'&&id){const project=await api('/projects/'+id);if(number!==routeNumber)return;state.project=project;state.tab='photos';}
+    const [,section,id,tab]=location.hash.split('/');
+    if(section==='project'&&id){const project=await api('/projects/'+id);if(number!==routeNumber)return;state.project=project;state.tab=['photos','story','versions','publish'].includes(tab)?tab:'photos';}
     else state.project=null;
     state.dirty=false;render();window.scrollTo(0,0);
   }catch(err){toast(err.message,true);if(!$('#main'))layout(`<div class="empty-small"><h1>暂时无法打开工作空间</h1><p>${e(err.message)}</p>${button('refresh','重试')}</div>`);}
@@ -224,11 +242,11 @@ async function onAction(action,el) {
   if(action==='xhs-confirm-draft'){el.disabled=true;try{await flush();setXhsStatus(await api('/projects/'+p.id+'/xhs-draft',{confirm_upload:true}));$('#modal').close();await reloadProject();}finally{if(el.isConnected)el.disabled=false;}return;}
   if(action==='tab'){await flush();state.tab=el.dataset.id;render();return;}
   if(action==='import'){$('#file-input').click();return;}
-  if(action==='toggle-photo'){const asset=p.assets.find(a=>a.id===el.dataset.id);asset.selected=!asset.selected;markDirty();render();return;}
-  if(action==='select-all'||action==='select-none'){p.assets.forEach(a=>a.selected=action==='select-all');markDirty();render();return;}
+  if(action==='toggle-photo'){const asset=p.assets.find(a=>a.id===el.dataset.id);asset.selected=!asset.selected;invalidatePrepareLocal();markDirty();render();return;}
+  if(action==='select-all'||action==='select-none'){p.assets.forEach(a=>a.selected=action==='select-all');invalidatePrepareLocal();markDirty();render();return;}
   if(action==='move-left'||action==='move-right'){
     const index=p.assets.findIndex(a=>a.id===el.dataset.id),to=index+(action==='move-left'?-1:1);
-    if(to>=0&&to<p.assets.length){[p.assets[index],p.assets[to]]=[p.assets[to],p.assets[index]];markDirty();render();}return;
+    if(to>=0&&to<p.assets.length){[p.assets[index],p.assets[to]]=[p.assets[to],p.assets[index]];invalidatePrepareLocal();markDirty();render();}return;
   }
   if(action==='preview'){
     const asset=p.assets.find(a=>a.id===el.dataset.id);
@@ -246,6 +264,8 @@ async function onAction(action,el) {
   }
   if(action==='export'){await flush();window.location.href='/api/projects/'+p.id+'/export';toast('正在导出原片、选片、文案与版本记录。');return;}
   if(action==='plan-local'||action==='plan-ai'){await startJob(action==='plan-ai'?'ai':'local');return;}
+  if(action==='prepare-cancel'){await flush();state.project=await api('/projects/'+p.id+'/xhs-prepare',{action:'cancel'});render();toast('已取消。没有生成本地素材包。');return;}
+  if(action==='prepare-freeze'){await flush();state.project=await api('/projects/'+p.id+'/xhs-prepare',{action:'freeze'});render();toast('本地已准备；插件未连接');return;}
   if(action==='group-local'||action==='group-ai'){
     await flush();const mode=action==='group-ai'?'ai':'local';const job=await api('/projects/'+p.id+'/groups',{mode});state.jobs.unshift(job);render();toast(mode==='ai'?'正在做 AI 风格核对。照片留在本机，只发送采样指标。':'正在生成本地分组草案。');return;
   }
@@ -305,8 +325,8 @@ document.addEventListener('input',event=>{
   }
   if(!p)return;
   if(element.id==='brief'){p.brief=element.value;markDirty();}
-  if(element.id==='story-title'){p.story.title=element.value;$('#story-preview-title').textContent=element.value||p.title;markDirty();}
-  if(element.id==='story-body'){p.story.body=element.value;$('#story-preview-body').textContent=element.value;markDirty();}
+  if(element.id==='story-title'){p.story.title=element.value;$('#story-preview-title').textContent=element.value||p.title;markDirty();invalidatePrepareLocal();}
+  if(element.id==='story-body'){p.story.body=element.value;$('#story-preview-body').textContent=element.value;markDirty();invalidatePrepareLocal();}
   if(element.id==='story-notes'){p.story.notes=element.value;markDirty();}
 });
 document.addEventListener('change',async event=>{
@@ -315,12 +335,19 @@ document.addEventListener('change',async event=>{
     if(element.id==='workflow-file'&&element.files[0]){const text=await element.files[0].text();JSON.parse(text);$('#workflow-json').value=text;}
     if(element.id==='file-input')await importFiles([...element.files]);
     if(!p)return;
-    if(element.name==='platforms'&&element.closest('.director-panel')){p.platforms=[...document.querySelectorAll('.director-panel input[name="platforms"]:checked')].map(input=>input.value);if(!p.platforms.length){element.checked=true;p.platforms=[element.value];toast('至少保留一个发布平台。');}p.platform=platformLabel(p.platforms[0]);$('#platform-summary').textContent=platformLabels(p);markDirty();}
+    if(element.name==='platforms'&&element.closest('.director-panel')){p.platforms=[...document.querySelectorAll('.director-panel input[name="platforms"]:checked')].map(input=>input.value);if(!p.platforms.length){element.checked=true;p.platforms=[element.value];toast('至少保留一个发布平台。');}p.platform=platformLabel(p.platforms[0]);$('#platform-summary').textContent=platformLabels(p);invalidatePrepareLocal();markDirty();}
     if(element.id==='project-recipe'){p.recipe_id=element.value||null;markDirty();await flush();render();}
     if(element.dataset.roleId){p.assets.find(a=>a.id===element.dataset.roleId).role=element.value;markDirty();}
     if(element.dataset.groupTitle){state.project=await api('/projects/'+p.id,{groups:[{id:element.dataset.groupTitle,title:element.value}]},'PATCH');render();}
+    if(element.dataset.prepareItem||element.id==='prepare-account'||element.id==='prepare-visibility'){
+      const account=$('#prepare-account')?.value||'', visibility=$('#prepare-visibility')?.value||'';
+      const item=element.dataset.prepareItem||(element.id==='prepare-account'?'account':'visibility');
+      const on=element.dataset.prepareItem?element.checked:false;
+      state.project=await api('/projects/'+p.id+'/xhs-prepare',{action:'confirm',item,on,account_intent:account,visibility_intent:visibility});
+      render();
+    }
     if(element.dataset.feedback){await flush();state.project=await api('/projects/'+p.id+'/feedback',{publication_id:element.dataset.feedback,feedback:element.value});toast('反馈已保存。');}
-  }catch(err){toast(err.message,true);}
+  }catch(err){toast(err.message,true);if(element?.dataset?.prepareItem)render();}
 });
 const readFile = file => new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=()=>reject(new Error('读取图片失败。'));reader.readAsDataURL(file);});
 async function prepareImage(file) {
@@ -365,7 +392,7 @@ document.addEventListener('dragleave',event=>event.target.closest('#dropzone,[da
 document.addEventListener('drop',async event=>{
   const target=event.target.closest('#dropzone,[data-asset]');if(!target)return;event.preventDefault();target.classList.remove('dragover');
   if(event.dataTransfer.files.length){await importFiles([...event.dataTransfer.files]);return;}
-  if(dragId&&target.dataset.asset&&dragId!==target.dataset.asset){const assets=state.project.assets,from=assets.findIndex(a=>a.id===dragId),to=assets.findIndex(a=>a.id===target.dataset.asset);if(from>=0&&to>=0){assets.splice(to,0,assets.splice(from,1)[0]);markDirty();render();}}
+  if(dragId&&target.dataset.asset&&dragId!==target.dataset.asset){const assets=state.project.assets,from=assets.findIndex(a=>a.id===dragId),to=assets.findIndex(a=>a.id===target.dataset.asset);if(from>=0&&to>=0){assets.splice(to,0,assets.splice(from,1)[0]);invalidatePrepareLocal();markDirty();render();}}
 });
 document.addEventListener('click',event=>{if(event.target.closest('#dropzone'))$('#file-input')?.click();});
 document.addEventListener('keydown',event=>{if(event.target.id==='dropzone'&&['Enter',' '].includes(event.key)){event.preventDefault();$('#file-input')?.click();}});

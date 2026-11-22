@@ -13,6 +13,7 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import struct
 import threading
@@ -25,7 +26,8 @@ import zipfile
 import zlib
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from xhs_connection import XHSConnection, ConnectionError as XHSConnectionError
+from easel_xhs import calc_title_length
+from xhs_connection import XHSConnection, ConnectionError as XHSConnectionError, validate_draft
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("PHOTOMAKER_DATA_DIR", str(ROOT / "data"))).resolve()
@@ -270,6 +272,182 @@ def update_project(project_id, body):
                     asset["role"] = item["role"]
                 ordered.append(asset)
             project["assets"] = ordered + [a for a in project["assets"] if a["id"] not in set(incoming_ids)]
+        if "story" in body or "assets" in body or "platforms" in body:
+            invalidate_local_prepare(project)
+        project["updated_at"] = now()
+        return put("projects", project)
+
+
+PREPARE_ITEMS = ("assets", "account", "text", "visibility")
+VISIBILITY_INTENTS = ("公开", "仅自己可见")
+
+
+def blank_prepare():
+    return {"status": "idle", "confirms": {item: False for item in PREPARE_ITEMS}, "account_intent": "", "visibility_intent": "",
+            "fingerprint": None, "package_id": None, "version_id": None}
+
+
+def selected_assets(project):
+    return [asset for asset in project["assets"] if asset["selected"]]
+
+
+def content_fingerprint(project):
+    selected = selected_assets(project)
+    return {"asset_ids": [asset["id"] for asset in selected], "cover_asset_id": selected[0]["id"] if selected else None,
+            "title": project["story"].get("title", "").strip(), "body": project["story"].get("body", "").strip()}
+
+
+def prepare_state(project):
+    value = project.get("xhs_prepare") or blank_prepare()
+    confirms = value.get("confirms") if isinstance(value.get("confirms"), dict) else {}
+    value["confirms"] = {item: bool(confirms.get(item)) for item in PREPARE_ITEMS}
+    value["account_intent"] = str(value.get("account_intent") or "")
+    value["visibility_intent"] = value.get("visibility_intent") if value.get("visibility_intent") in VISIBILITY_INTENTS else ""
+    return value
+
+
+def full_fingerprint(project, prep):
+    return {**content_fingerprint(project), "account_intent": prep["account_intent"].strip(), "visibility_intent": prep["visibility_intent"]}
+
+
+def drop_prepare_package(prep):
+    package_id = prep.get("package_id") or ""
+    if not re.fullmatch(r"[a-f0-9]{32}", package_id):
+        return
+    root = (DATA / "local-prepare").resolve()
+    target = (root / package_id).resolve()
+    if target.parent == root and target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target)
+
+
+def invalidate_local_prepare(project):
+    prep = project.get("xhs_prepare")
+    if not prep or not prep.get("fingerprint"):
+        return
+    stored = {key: prep["fingerprint"].get(key) for key in ("asset_ids", "cover_asset_id", "title", "body")}
+    still_target = "xiaohongshu" in project.get("platforms", [])
+    if stored == content_fingerprint(project) and still_target:
+        return
+    drop_prepare_package(prep)
+    kept = blank_prepare()
+    kept["account_intent"] = str(prep.get("account_intent") or "")
+    kept["visibility_intent"] = prep.get("visibility_intent") if prep.get("visibility_intent") in VISIBILITY_INTENTS else ""
+    project["xhs_prepare"] = kept
+
+
+def safe_asset_bytes(asset):
+    name = asset.get("file") or ""
+    if not re.fullmatch(r"[a-f0-9]{64}\.(jpg|png|webp)", name):
+        raise Problem("素材路径无效，没有打包。")
+    path = DATA / "assets" / name
+    if path.is_symlink() or not path.is_file():
+        raise Problem("素材必须是素材库中的普通文件，没有打包。")
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != asset.get("sha256"):
+        raise Problem("素材内容和记录不一致，没有打包。")
+    return data
+
+
+def local_xhs_prepare(project_id, body):
+    # Local manifest only. This function does not open Xiaohongshu or call the old uploader.
+    action = body.get("action")
+    with LOCK:
+        project = get("projects", project_id)
+        prep = prepare_state(project)
+        if action == "cancel":
+            drop_prepare_package(prep)
+            project["xhs_prepare"] = blank_prepare()
+            project["updated_at"] = now()
+            return put("projects", project)
+        if action == "confirm":
+            drop_prepare_package(prep)
+            prep["package_id"] = prep["version_id"] = None
+            prep["status"] = "idle"
+            item = body.get("item")
+            if item not in PREPARE_ITEMS:
+                raise Problem("确认项无效。")
+            if "account_intent" in body and str(body.get("account_intent") or "").strip() != prep["account_intent"]:
+                prep["confirms"] = {key: False for key in PREPARE_ITEMS}
+                drop_prepare_package(prep)
+                prep["package_id"] = prep["version_id"] = None
+            if "account_intent" in body:
+                prep["account_intent"] = str(body.get("account_intent") or "").strip()[:80]
+            if "visibility_intent" in body and body.get("visibility_intent") != prep["visibility_intent"]:
+                prep["confirms"] = {key: False for key in PREPARE_ITEMS}
+                drop_prepare_package(prep)
+                prep["package_id"] = prep["version_id"] = None
+            if "visibility_intent" in body:
+                visibility = body.get("visibility_intent") or ""
+                if visibility not in VISIBILITY_INTENTS and visibility != "":
+                    raise Problem("可见范围意图只能是公开或仅自己可见。")
+                prep["visibility_intent"] = visibility
+            current = full_fingerprint(project, prep)
+            if prep.get("fingerprint") and {key: prep["fingerprint"].get(key) for key in current} != current:
+                prep["confirms"] = {key: False for key in PREPARE_ITEMS}
+                drop_prepare_package(prep)
+            if body.get("on"):
+                if item == "assets" and not current["asset_ids"]:
+                    raise Problem("先选好至少一张照片，才能确认素材。")
+                if item == "text" and (not current["title"] or not current["body"]):
+                    raise Problem("标题和正文都要有内容，才能确认正文。")
+                if item == "text" and (calc_title_length(current["title"]) > 20 or len(current["body"].encode("utf-16-le")) // 2 > 1000):
+                    raise Problem("标题需不超过 20 个全角字，正文需不超过 1000 个 UTF-16 字符。")
+                if item == "account" and not current["account_intent"]:
+                    raise Problem("先写下账号意图，才能确认。")
+                if item == "visibility" and current["visibility_intent"] not in VISIBILITY_INTENTS:
+                    raise Problem("先选择可见范围意图，才能确认。")
+                prep["confirms"][item] = True
+            else:
+                prep["confirms"][item] = False
+                drop_prepare_package(prep)
+            prep["fingerprint"] = current
+            prep["status"] = "idle"
+            prep["package_id"] = prep["version_id"] = None
+            project["xhs_prepare"] = prep
+            project["updated_at"] = now()
+            return put("projects", project)
+        if action != "freeze":
+            raise Problem("不支持的本地准备操作。")
+        current = full_fingerprint(project, prep)
+        if prep.get("fingerprint") != current or not all(prep["confirms"].values()):
+            raise Problem("四项确认未齐，或内容已变化。没有生成本地素材包。")
+        if "xiaohongshu" not in project.get("platforms", []):
+            raise Problem("请先把小红书留在发布目标里。没有打包。")
+        try:
+            validate_draft(project, DATA)
+        except XHSConnectionError as error:
+            raise Problem(str(error))
+        selected = selected_assets(project)
+        package_id = ident()
+        root = DATA / "local-prepare" / package_id
+        root.mkdir(parents=True)
+        try:
+            listed = []
+            for index, asset in enumerate(selected, 1):
+                blob = safe_asset_bytes(asset)
+                ext = asset["file"].rsplit(".", 1)[-1]
+                filename = "%02d.%s" % (index, ext)
+                (root / filename).write_bytes(blob)
+                listed.append({"name": filename, "sha256": hashlib.sha256(blob).hexdigest(), "asset_id": asset["id"], "cover": index == 1})
+            manifest = {
+                "kind": "photomaker-local-prepare", "schema": "photomaker.xhs-image-prepare.v1", "plugin": "not-connected",
+                "status": "本地已准备；插件未连接", "claims_platform_set": False, "maitian_api": False,
+                "project_id": project["id"], "title": current["title"], "body": current["body"],
+                "account_intent": current["account_intent"], "visibility_intent": current["visibility_intent"],
+                "cover_index": 1, "files": listed,
+                "note": "这是 PhotoMaker 自己的本地清单，不是麦田或小红书的接口。账号和可见范围只是意图，平台尚未设置。插件未连接。",
+            }
+            (root / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+        prep["fingerprint"] = current
+        prep["status"] = "ready"
+        prep["package_id"] = package_id
+        project["xhs_prepare"] = prep
+        version = add_version(project, "小红书图文本地准备", "xhs-local-prepare", {"package_id": package_id, "plugin": "not-connected", "files": listed,
+                                                                              "account_intent": current["account_intent"], "visibility_intent": current["visibility_intent"]})
+        project["xhs_prepare"]["version_id"] = version["id"]
         project["updated_at"] = now()
         return put("projects", project)
 
@@ -1216,6 +1394,8 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 2:
                 return update_project(project_id, body) if method == "PATCH" else get("projects", project_id)
             action = parts[2]
+            if action == "xhs-prepare" and method == "POST":
+                return local_xhs_prepare(project_id, body)
             if action == "xhs-draft" and method == "POST":
                 if body.get("confirm_upload") is not True:
                     raise Problem("请先确认将选片和文案上传到小红书。")
