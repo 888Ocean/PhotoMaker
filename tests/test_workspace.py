@@ -239,5 +239,377 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(app.get("jobs", job["id"])["status"], "failed")
 
 
+def solid_png(red, green, blue, width=8, height=8):
+    import struct
+    import zlib
+    raw = b"".join(b"\x00" + bytes((red, green, blue)) * width for _ in range(height))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
+class GroupingTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="photomaker-group-")
+        self.original = app.DATA
+        app.DATA = Path(self.directory.name)
+        app.init()
+        self.project = app.new_project({"title": "潮汐", "brief": "安静的蓝色", "platform": "小红书"})
+
+    def tearDown(self):
+        app.DATA = self.original
+        self.directory.cleanup()
+
+    def upload(self, raw, **kwargs):
+        body = {"data": base64.b64encode(raw).decode(), "name": "原片.png", "features": {"width": 1, "height": 1, "contrast": 25}}
+        body.update(kwargs)
+        return app.upload(self.project["id"], body)
+
+    def test_png_sample_fills_missing_metrics_without_replacing_client_palette(self):
+        sampled = self.upload(solid_png(20, 40, 180), features={})["asset"]["features"]
+        self.assertEqual(sampled["width"], 8)
+        self.assertGreater(sampled["brightness"], 0)
+        self.assertTrue(sampled["palette"])
+        kept = self.upload(solid_png(200, 20, 20), name="kept.png", features={"width": 4, "height": 4, "brightness": 10, "contrast": 11, "palette": ["#112233"]})
+        self.assertEqual(kept["asset"]["features"]["palette"], ["#112233"])
+        self.assertEqual(kept["asset"]["features"]["brightness"], 10)
+
+    def test_color_groups_split_warm_and_blue_and_local_review_is_labeled(self):
+        warm = {"width": 8, "height": 8, "brightness": 60, "contrast": 20, "palette": ["#c06030", "#d07040"]}
+        warm_b = {"width": 8, "height": 8, "brightness": 62, "contrast": 30, "palette": ["#c86838", "#cc7048"]}
+        blue = {"width": 8, "height": 8, "brightness": 40, "contrast": 12, "palette": ["#204080", "#183868"]}
+        self.upload(solid_png(1, 1, 1), name="a.png", features=warm)
+        self.upload(solid_png(2, 2, 2), name="b.png", features=warm_b)
+        self.upload(solid_png(3, 3, 3), name="c.png", features=blue)
+        job, project = app.create_job(self.project["id"], "groups", "local")
+        with patch.object(app, "remote", side_effect=AssertionError("local grouping must not use the network")):
+            app.run_groups(job["id"], project, "local")
+        result = self.latest()
+        self.assertEqual(app.get("jobs", job["id"])["status"], "completed")
+        self.assertEqual(len(result["groups"]), 2)
+        warm_ids = {asset["id"] for asset in result["assets"] if asset["name"] in ("a.png", "b.png")}
+        blue_ids = {asset["id"] for asset in result["assets"] if asset["name"] == "c.png"}
+        self.assertIn(warm_ids, [set(group["asset_ids"]) for group in result["groups"]])
+        self.assertIn(blue_ids, [set(group["asset_ids"]) for group in result["groups"]])
+        for group in result["groups"]:
+            self.assertIn(group["cover_asset_id"], group["asset_ids"])
+            self.assertEqual(group["review"]["label"], "本地规则草案")
+            self.assertEqual(group["review"]["origin"], "local")
+            self.assertFalse(group["review"]["photos_sent"])
+            self.assertIn("不是", group["reason"])
+        self.assertTrue(any("暖调" in group["title"] or "蓝调" in group["title"] for group in result["groups"]))
+        self.assertEqual(result["versions"][-1]["source"], "group-local")
+        self.assertIn("groups", result["versions"][-2])
+
+    def test_filename_series_stays_together_when_colors_match(self):
+        blob = solid_png(80, 140, 180)
+        self.upload(blob, name="aegean-cover.png", features={})
+        self.upload(blob + b"\x00", name="aegean-vessel.png", features={})
+        self.upload(blob + b"\x00\x00", name="nostos-cover.png", features={})
+        groups = app.build_groups(self.latest())
+        names = {asset["name"]: asset["id"] for asset in self.latest()["assets"]}
+        aegean = next(group for group in groups if names["aegean-cover.png"] in group["asset_ids"])
+        self.assertIn(names["aegean-vessel.png"], aegean["asset_ids"])
+        self.assertNotIn(names["nostos-cover.png"], aegean["asset_ids"])
+        self.assertEqual(aegean["signal"], "filename")
+        titles = [group["title"] for group in groups]
+        self.assertIn("潮汐 · 蓝调", titles)
+        self.assertIn("潮汐 · 蓝调 2", titles)
+        self.assertNotIn("潮汐 · 蓝调 3", titles)
+
+    def test_design_output_series_are_separate_groups(self):
+        root = Path(__file__).resolve().parents[1] / "design_output"
+        names = [
+            "starburst-series/jeju-diffraction-01.png",
+            "starburst-series/jeju-diffraction-cover.png",
+            "odyssey-nostos/nostos-cover-1080x1350.png",
+            "odyssey-nostos/nostos-vessel-1080x1350.png",
+            "odyssey-aegean-afterlight/aegean-cover-1080x1350.png",
+            "odyssey-aegean-afterlight/aegean-vessel-clean-2048x1365.png",
+        ]
+        for name in names:
+            self.upload((root / name).read_bytes(), name=Path(name).name, features={})
+        result = self.latest()
+        groups = app.build_groups(result)
+        def group_for(*filenames):
+            ids = {asset["id"] for asset in result["assets"] if asset["name"] in filenames}
+            return next(group for group in groups if ids <= set(group["asset_ids"]))
+        diffraction = group_for("jeju-diffraction-01.png", "jeju-diffraction-cover.png")
+        nostos = group_for("nostos-cover-1080x1350.png", "nostos-vessel-1080x1350.png")
+        aegean = group_for("aegean-cover-1080x1350.png", "aegean-vessel-clean-2048x1365.png")
+        self.assertEqual(len({diffraction["id"], nostos["id"], aegean["id"]}), 3)
+        color = next(item for item in aegean["review"]["items"] if item["aspect"] == "色彩")
+        self.assertEqual(color["level"], "warn")
+        self.assertEqual(aegean["review"]["style_name"], "未指定风格")
+
+    def test_manual_title_cover_and_apply_leave_the_decision_with_the_user(self):
+        warm = {"width": 8, "height": 8, "brightness": 55, "contrast": 15, "palette": ["#c06030"]}
+        warm_b = {"width": 8, "height": 8, "brightness": 58, "contrast": 35, "palette": ["#c86838"]}
+        blue = {"width": 8, "height": 8, "brightness": 40, "contrast": 12, "palette": ["#204080"]}
+        self.upload(solid_png(1, 1, 1), name="a.png", features=warm)
+        self.upload(solid_png(2, 2, 2), name="b.png", features=warm_b)
+        self.upload(solid_png(3, 3, 3), name="c.png", features=blue)
+        job, project = app.create_job(self.project["id"], "groups", "local")
+        app.run_groups(job["id"], project, "local")
+        result = self.latest()
+        self.assertEqual(result["story"]["title"], "")
+        group = next(item for item in result["groups"] if len(item["asset_ids"]) == 2)
+        other = next(item for item in result["groups"] if item["id"] != group["id"])
+        replacement = next(asset_id for asset_id in group["asset_ids"] if asset_id != group["cover_asset_id"])
+        revised = app.update_project(self.project["id"], {"groups": [{"id": group["id"], "title": "老板定的标题", "cover_asset_id": replacement}]})
+        saved = next(item for item in revised["groups"] if item["id"] == group["id"])
+        self.assertEqual(saved["title"], "老板定的标题")
+        self.assertEqual(saved["title_origin"], "manual")
+        self.assertEqual(saved["cover_asset_id"], replacement)
+        self.assertEqual(saved["cover_origin"], "manual")
+        self.assertEqual(revised["story"]["title"], "")
+        with self.assertRaises(app.Problem):
+            app.update_project(self.project["id"], {"groups": [{"id": group["id"], "cover_asset_id": "missing"}]})
+        applied = app.apply_group(self.project["id"], {"group_id": group["id"], "use_title": True, "use_cover": True, "use_set": True})
+        selected = [asset["id"] for asset in applied["assets"] if asset["selected"]]
+        self.assertEqual(selected, [replacement] + [asset_id for asset_id in group["asset_ids"] if asset_id != replacement])
+        self.assertEqual(applied["story"]["title"], "老板定的标题")
+        self.assertTrue(all(not asset["selected"] for asset in applied["assets"] if asset["id"] in set(other["asset_ids"])))
+
+    def test_ai_review_is_labeled_and_does_not_send_photos(self):
+        self.upload(solid_png(1, 2, 3), name="a.png", features={"width": 8, "height": 8, "brightness": 30, "contrast": 10, "palette": ["#102030"]})
+        self.upload(solid_png(4, 5, 6), name="b.png", features={"width": 8, "height": 8, "brightness": 70, "contrast": 20, "palette": ["#e0c0a0"]})
+        app.save_settings({"ai_base_url": "http://127.0.0.1:9999/v1", "ai_model": "test-model", "ai_vision": True})
+        recipe = app.make_recipe({"name": "潮汐蓝", "description": "柔和的蓝", "positive_prompt": "muted blue"})
+        app.update_project(self.project["id"], {"recipe_id": recipe["id"]})
+        job, project = app.create_job(self.project["id"], "groups", "ai")
+        groups = app.build_groups(project)
+
+        def model(config, role, payload, images=None):
+            self.assertEqual(role, "风格核对")
+            self.assertIsNone(images)
+            self.assertFalse(payload["photos_sent"])
+            self.assertEqual(payload["style"]["name"], "潮汐蓝")
+            encoded = json.dumps(payload)
+            self.assertNotIn("base64", encoded)
+            self.assertNotIn("image_url", encoded)
+            return {"groups": [{"asset_ids": group["asset_ids"], "title": "夜航 %s" % index, "cover_id": group["cover_asset_id"],
+                                "summary": "只根据采样指标。", "items": [{"aspect": "色彩", "level": "note", "detail": "未见照片"}]} for index, group in enumerate(groups, 1)]}
+
+        with patch.object(app, "call_model", side_effect=model) as mock:
+            app.run_groups(job["id"], project, "ai")
+        result = self.latest()
+        self.assertEqual(mock.call_count, 1)
+        self.assertEqual(app.get("jobs", job["id"])["status"], "completed")
+        self.assertEqual(result["groups"][0]["review"]["label"], "AI 风格核对")
+        self.assertEqual(result["groups"][0]["review"]["provider"]["model"], "test-model")
+        self.assertNotIn("ai_api_key", json.dumps(result["groups"]))
+        self.assertIn("未发送照片", result["groups"][0]["review"]["limit"])
+        self.assertTrue(result["groups"][0]["title"].startswith("夜航"))
+        self.assertEqual([asset["selected"] for asset in result["assets"]], [True, True])
+
+    def test_invalid_ai_review_and_late_import_do_not_write_groups(self):
+        self.upload(solid_png(9, 9, 9), name="a.png", features={"width": 4, "height": 4, "brightness": 40, "contrast": 10, "palette": ["#888888"]})
+        app.save_settings({"ai_base_url": "http://127.0.0.1:9999/v1", "ai_model": "test-model"})
+        job, project = app.create_job(self.project["id"], "groups", "ai")
+        with patch.object(app, "call_model", return_value={"groups": []}):
+            app.run_groups(job["id"], project, "ai")
+        self.assertEqual(app.get("jobs", job["id"])["status"], "failed")
+        self.assertFalse(self.latest().get("groups"))
+        job, snapshot = app.create_job(self.project["id"], "groups", "local")
+        self.upload(solid_png(8, 8, 8), name="late.png", features={"width": 4, "height": 4, "brightness": 41, "contrast": 10, "palette": ["#808080"]})
+        app.run_groups(job["id"], snapshot, "local")
+        self.assertEqual(app.get("jobs", job["id"])["status"], "failed")
+        self.assertEqual(len(self.latest()["assets"]), 2)
+        self.assertFalse(self.latest().get("groups"))
+        handler = object.__new__(app.Handler)
+        with self.assertRaises(app.Problem):
+            handler.api("POST", ["projects", self.project["id"], "groups"], {"mode": "sideways"})
+
+    def latest(self):
+        return app.get("projects", self.project["id"])
+
+
+class LocalPrepareTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="photomaker-prepare-")
+        self.original = app.DATA
+        app.DATA = Path(self.directory.name)
+        app.init()
+        self.project = app.new_project({"title": "合成图文", "brief": "", "platform": "小红书"})
+
+    def tearDown(self):
+        app.DATA = self.original
+        self.directory.cleanup()
+
+    def upload(self, raw, name):
+        body = {"data": base64.b64encode(raw).decode(), "name": name, "features": {"width": 8, "height": 8, "brightness": 40, "contrast": 10, "palette": ["#224466"]}}
+        return app.upload(self.project["id"], body)["asset"]
+
+    def ready_story(self):
+        first = self.upload(solid_png(20, 40, 180), "synthetic-note-01.png")
+        second = self.upload(solid_png(200, 120, 40), "synthetic-note-02.png")
+        app.update_project(self.project["id"], {"story": {"title": "合成标题", "body": "合成正文", "notes": "不进清单"}})
+        return first, second
+
+    def confirm_all(self):
+        for item in ("assets", "text", "account", "visibility"):
+            app.local_xhs_prepare(self.project["id"], {"action": "confirm", "item": item, "on": True, "account_intent": "合成账号意图", "visibility_intent": "仅自己可见"})
+
+    def test_preview_fingerprint_matches_selection_cover_title_and_body(self):
+        first, second = self.ready_story()
+        app.update_project(self.project["id"], {"assets": [{"id": second["id"], "selected": True}, {"id": first["id"], "selected": True}]})
+        view = app.content_fingerprint(app.get("projects", self.project["id"]))
+        self.assertEqual(view["asset_ids"], [second["id"], first["id"]])
+        self.assertEqual(view["cover_asset_id"], second["id"])
+        self.assertEqual(view["title"], "合成标题")
+        self.assertEqual(view["body"], "合成正文")
+
+    def latest(self):
+        return app.get("projects", self.project["id"])
+
+    def assert_freeze_blocked(self):
+        with self.assertRaises(app.Problem):
+            app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
+        self.assertFalse((app.DATA / "local-prepare").exists())
+
+    def test_each_missing_confirm_blocks_freeze(self):
+        self.ready_story()
+        self.assert_freeze_blocked()
+        for missing in ("assets", "text", "account", "visibility"):
+            app.local_xhs_prepare(self.project["id"], {"action": "cancel"})
+            for item in ("assets", "text", "account", "visibility"):
+                if item == missing:
+                    continue
+                app.local_xhs_prepare(self.project["id"], {"action": "confirm", "item": item, "on": True, "account_intent": "合成账号意图", "visibility_intent": "仅自己可见"})
+            confirms = self.latest()["xhs_prepare"]["confirms"]
+            self.assertFalse(confirms[missing])
+            self.assertTrue(all(confirms[item] for item in confirms if item != missing))
+            self.assert_freeze_blocked()
+
+    def test_each_edit_revokes_every_confirm(self):
+        first, second = self.ready_story()
+        third = self.upload(solid_png(10, 180, 90), "synthetic-note-03.png")
+        cases = []
+
+        def revoke(name, mutate):
+            app.local_xhs_prepare(self.project["id"], {"action": "cancel"})
+            self.confirm_all()
+            mutate()
+            confirms = self.latest()["xhs_prepare"]["confirms"]
+            self.assertTrue(all(not value for value in confirms.values()), name)
+            self.assert_freeze_blocked()
+            cases.append(name)
+
+        current = self.latest()
+        ordered = [asset["id"] for asset in current["assets"]]
+        revoke("order", lambda: app.update_project(self.project["id"], {"assets": [
+            {"id": ordered[0], "selected": True, "role": "环境"},
+            {"id": ordered[2], "selected": True, "role": "细节"},
+            {"id": ordered[1], "selected": True, "role": "环境"},
+        ]}))
+        revoke("cover", lambda: app.update_project(self.project["id"], {"assets": [
+            {"id": second["id"], "selected": True, "role": "环境"},
+            {"id": first["id"], "selected": True, "role": "细节"},
+            {"id": third["id"], "selected": False, "role": "环境"},
+        ]}))
+        revoke("asset-set", lambda: app.update_project(self.project["id"], {"assets": [
+            {"id": first["id"], "selected": True, "role": "环境"},
+            {"id": second["id"], "selected": False, "role": "细节"},
+            {"id": third["id"], "selected": True, "role": "环境"},
+        ]}))
+        revoke("title", lambda: app.update_project(self.project["id"], {"story": {"title": "改过的标题", "body": "合成正文", "notes": ""}}))
+        revoke("body", lambda: app.update_project(self.project["id"], {"story": {"title": "合成标题", "body": "另一段正文", "notes": ""}}))
+        revoke("account-intent", lambda: app.local_xhs_prepare(self.project["id"], {"action": "confirm", "item": "account", "on": False, "account_intent": "另一个账号意图", "visibility_intent": "仅自己可见"}))
+        revoke("visibility-intent", lambda: app.local_xhs_prepare(self.project["id"], {"action": "confirm", "item": "visibility", "on": False, "account_intent": "合成账号意图", "visibility_intent": "公开"}))
+        self.assertEqual(cases, ["order", "cover", "asset-set", "title", "body", "account-intent", "visibility-intent"])
+
+    def test_cancel_drops_only_its_package_and_makes_no_external_call(self):
+        self.ready_story()
+        calls = []
+
+        def record(name):
+            def wrapped(*args, **kwargs):
+                calls.append(name)
+                raise AssertionError(name)
+            return wrapped
+
+        with patch.object(app.urllib.request, "urlopen", side_effect=record("urlopen")), \
+             patch.object(app, "xhs_connection", side_effect=record("xhs_connection")), \
+             patch.object(app, "remote", side_effect=record("remote")), \
+             patch.object(app.XHSConnection, "prepare", side_effect=record("XHSConnection.prepare")), \
+             patch.object(app.XHSConnection, "connect", side_effect=record("XHSConnection.connect")):
+            app.local_xhs_prepare(self.project["id"], {"action": "cancel"})
+            self.assertEqual(calls, [])
+            self.confirm_all()
+            packed = app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
+            self.assertEqual(calls, [])
+        package = app.DATA / "local-prepare" / packed["xhs_prepare"]["package_id"]
+        decoy = app.DATA / "local-prepare" / "not-a-package"
+        decoy.mkdir()
+        (decoy / "keep.txt").write_text("do-not-delete", encoding="utf-8")
+        settings = app.DATA / "settings.json"
+        settings.write_text("{}", encoding="utf-8")
+        versions_before = len(packed["versions"])
+        cancelled = app.local_xhs_prepare(self.project["id"], {"action": "cancel"})
+        self.assertEqual(cancelled["xhs_prepare"]["status"], "idle")
+        self.assertFalse(package.exists())
+        self.assertEqual((decoy / "keep.txt").read_text(), "do-not-delete")
+        self.assertTrue(settings.is_file())
+        self.assertEqual(len(cancelled["versions"]), versions_before)
+
+    def test_package_matches_checksums_and_cannot_escape_asset_dir(self):
+        first, second = self.ready_story()
+        self.confirm_all()
+        calls = []
+
+        def record(name):
+            def wrapped(*args, **kwargs):
+                calls.append(name)
+                raise AssertionError(name)
+            return wrapped
+
+        with patch.object(app.urllib.request, "urlopen", side_effect=record("urlopen")), \
+             patch.object(app, "xhs_connection", side_effect=record("xhs_connection")), \
+             patch.object(app, "remote", side_effect=record("remote")), \
+             patch.object(app.XHSConnection, "prepare", side_effect=record("XHSConnection.prepare")), \
+             patch.object(app.XHSConnection, "connect", side_effect=record("XHSConnection.connect")), \
+             patch.object(app.XHSConnection, "status", side_effect=record("XHSConnection.status")):
+            packed = app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
+        self.assertEqual(calls, [])
+        prep = packed["xhs_prepare"]
+        self.assertEqual(prep["status"], "ready")
+        package = app.DATA / "local-prepare" / prep["package_id"]
+        names = sorted(path.name for path in package.iterdir())
+        self.assertEqual(names, ["01.png", "02.png", "manifest.json"])
+        manifest = json.loads((package / "manifest.json").read_text())
+        self.assertEqual(manifest["kind"], "photomaker-local-prepare")
+        self.assertFalse(manifest["maitian_api"])
+        self.assertFalse(manifest["claims_platform_set"])
+        self.assertEqual(manifest["status"], "本地已准备；插件未连接")
+        self.assertEqual(manifest["account_intent"], "合成账号意图")
+        self.assertEqual(manifest["visibility_intent"], "仅自己可见")
+        self.assertNotIn("settings.json", names)
+        for item in manifest["files"]:
+            blob = (package / item["name"]).read_bytes()
+            self.assertEqual(app.hashlib.sha256(blob).hexdigest(), item["sha256"])
+            self.assertFalse((package / item["name"]).is_symlink())
+        self.assertEqual((package / "01.png").read_bytes(), (app.DATA / "assets" / first["file"]).read_bytes())
+        self.assertEqual(packed["versions"][-1]["source"], "xhs-local-prepare")
+        self.assertEqual(packed["versions"][-1]["details"]["files"], manifest["files"])
+        outside = app.DATA / "settings.json"
+        outside.write_text('{"ai_api_key":"secret"}', encoding="utf-8")
+        link = app.DATA / "assets" / first["file"]
+        link.unlink()
+        link.symlink_to(outside)
+        self.confirm_all()
+        with self.assertRaises(app.Problem):
+            app.local_xhs_prepare(self.project["id"], {"action": "freeze"})
+        self.assertFalse(any(path.name != "manifest.json" and "secret" in path.read_text(errors="ignore") for path in (app.DATA / "local-prepare").glob("*/*")))
+        with self.assertRaises(app.Problem):
+            app.safe_asset_bytes({"file": "../settings.json", "sha256": "abc"})
+
+    def latest_unused(self):
+        return None
+
+
 if __name__ == "__main__":
     unittest.main()
